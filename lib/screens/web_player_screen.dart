@@ -1,7 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 
-import '../app_theme.dart';
 import '../models/video_item.dart';
 
 /// Full-screen WebView player for links whose deep-link host resolved to the
@@ -52,7 +51,6 @@ class _WebPlayerScreenState extends State<WebPlayerScreen> {
     return Scaffold(
       backgroundColor: Colors.black,
       appBar: AppBar(
-        backgroundColor: AppTheme.primaryRed,
         title: Text(
           widget.item.title.isEmpty ? 'Web Player' : widget.item.title,
           overflow: TextOverflow.ellipsis,

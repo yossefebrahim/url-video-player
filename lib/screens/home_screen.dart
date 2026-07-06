@@ -1,8 +1,8 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
-import '../app_theme.dart';
 import '../models/video_item.dart';
 import '../services/cast_service.dart';
 import '../services/deep_link_service.dart';
@@ -23,18 +23,18 @@ class HomeScreen extends StatefulWidget {
   State<HomeScreen> createState() => _HomeScreenState();
 }
 
-class _HomeScreenState extends State<HomeScreen>
-    with SingleTickerProviderStateMixin {
+class _HomeScreenState extends State<HomeScreen> {
+  // Reused by the "Add URL" bottom sheet each time it opens.
   final _titleCtrl = TextEditingController();
   final _urlCtrl = TextEditingController();
   final _uaCtrl = TextEditingController();
 
-  late final TabController _tab;
   final _db = HistoryDatabase.instance;
 
   VideoItem? _current;
   List<VideoItem> _history = const [];
   List<VideoItem> _favorites = const [];
+  int _contentIndex = 0; // 0 = History, 1 = Favorites
   StreamSubscription<ParsedLink>? _sub;
 
   /// Kept current by the local player; read when starting a Cast hand-off.
@@ -43,9 +43,10 @@ class _HomeScreenState extends State<HomeScreen>
   @override
   void initState() {
     super.initState();
-    _tab = TabController(length: 3, vsync: this);
     _reload();
     _initDeepLinks();
+    CastService.instance.passiveDisconnects
+        .addListener(_onPassiveCastDisconnect);
   }
 
   Future<void> _initDeepLinks() async {
@@ -59,16 +60,14 @@ class _HomeScreenState extends State<HomeScreen>
     _sub = DeepLinkService.instance.linkStream.listen(_handleLink);
   }
 
-  /// Populates the form with [item] and switches to the PLAYER tab.
-  void _selectItem(VideoItem item) {
-    _titleCtrl.text = item.title;
-    _urlCtrl.text = item.url;
-    _uaCtrl.text = item.userAgent ?? '';
-    _tab.animateTo(0);
+  void _onPassiveCastDisconnect() {
+    if (mounted) _snack('Cast disconnected.');
   }
 
+  /// A deep link / shared URL: persist to history, and play it if it was an
+  /// explicit hand-off. A non-autoplay shared link simply lands in history
+  /// (frame-safe — no bottom sheet at cold start).
   void _handleLink(ParsedLink link) {
-    _selectItem(link.item);
     _openItem(link.item, autoPlay: link.autoPlay);
   }
 
@@ -127,11 +126,112 @@ class _HomeScreenState extends State<HomeScreen>
     _reload();
   }
 
-  Future<void> _saveAndPlay() async {
+  // ── Add-URL bottom sheet ──────────────────────────────────────────────────
+
+  Future<void> _openAddUrlSheet([VideoItem? prefill]) async {
+    if (prefill != null) {
+      _titleCtrl.text = prefill.title;
+      _urlCtrl.text = prefill.url;
+      _uaCtrl.text = prefill.userAgent ?? '';
+    }
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      builder: _buildAddUrlSheet,
+    );
+  }
+
+  Widget _buildAddUrlSheet(BuildContext sheetContext) {
+    final text = Theme.of(sheetContext).textTheme;
+    return Padding(
+      padding: EdgeInsets.only(
+        left: 16,
+        right: 16,
+        top: 4,
+        bottom: MediaQuery.of(sheetContext).viewInsets.bottom + 16,
+      ),
+      child: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Text('Add a video URL', style: text.titleLarge),
+            const SizedBox(height: 16),
+            TextField(
+              controller: _titleCtrl,
+              textInputAction: TextInputAction.next,
+              decoration: const InputDecoration(
+                hintText: 'Video Title (optional)',
+                prefixIcon: Icon(Icons.title),
+              ),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _urlCtrl,
+              keyboardType: TextInputType.url,
+              textInputAction: TextInputAction.done,
+              autofocus: _urlCtrl.text.isEmpty,
+              onSubmitted: (_) => _submitFromSheet(sheetContext),
+              decoration: InputDecoration(
+                hintText: 'Video URL',
+                prefixIcon: const Icon(Icons.link),
+                suffixIcon: IconButton(
+                  tooltip: 'Paste',
+                  icon: const Icon(Icons.content_paste),
+                  onPressed: _pasteUrl,
+                ),
+              ),
+            ),
+            const SizedBox(height: 4),
+            Theme(
+              data: Theme.of(sheetContext)
+                  .copyWith(dividerColor: Colors.transparent),
+              child: ExpansionTile(
+                tilePadding: EdgeInsets.zero,
+                childrenPadding: const EdgeInsets.only(bottom: 8),
+                title: const Text('Advanced'),
+                children: [
+                  TextField(
+                    controller: _uaCtrl,
+                    textInputAction: TextInputAction.done,
+                    onSubmitted: (_) => _submitFromSheet(sheetContext),
+                    decoration: const InputDecoration(
+                      hintText: 'User Agent (optional)',
+                      prefixIcon: Icon(Icons.public),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 12),
+            FilledButton.icon(
+              onPressed: () => _submitFromSheet(sheetContext),
+              icon: const Icon(Icons.play_arrow_rounded, size: 26),
+              label: const Text('PLAY'),
+            ),
+            const SizedBox(height: 8),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _pasteUrl() async {
+    final data = await Clipboard.getData(Clipboard.kTextPlain);
+    final t = data?.text?.trim();
+    if (t != null && t.isNotEmpty) _urlCtrl.text = t;
+  }
+
+  Future<void> _submitFromSheet(BuildContext sheetContext) async {
+    final ok = await _submitAddUrl();
+    if (ok && sheetContext.mounted) Navigator.of(sheetContext).pop();
+  }
+
+  Future<bool> _submitAddUrl() async {
     final url = _urlCtrl.text.trim();
     if (url.isEmpty) {
       _snack('Please enter a video URL');
-      return;
+      return false;
     }
     final title = _titleCtrl.text.trim();
     final ua = _uaCtrl.text.trim();
@@ -144,7 +244,13 @@ class _HomeScreenState extends State<HomeScreen>
     );
     FocusScope.of(context).unfocus();
     await _openItem(item, autoPlay: true);
+    _titleCtrl.clear();
+    _urlCtrl.clear();
+    _uaCtrl.clear();
+    return true;
   }
+
+  // ── list actions ──────────────────────────────────────────────────────────
 
   Future<void> _toggleFavorite(VideoItem item) async {
     await _db.setFavorite(item.url, !item.favorite);
@@ -154,6 +260,49 @@ class _HomeScreenState extends State<HomeScreen>
   Future<void> _delete(VideoItem item) async {
     await _db.deleteByUrl(item.url);
     await _reload();
+    if (!mounted) return;
+    final name = item.title.isEmpty ? 'video' : item.title;
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(
+        SnackBar(
+          content: Text('Deleted “$name”'),
+          action: SnackBarAction(
+            label: 'Undo',
+            onPressed: () async {
+              // Identity is the URL — upsert restores favorite + metadata.
+              await _db.upsert(item);
+              await _reload();
+            },
+          ),
+        ),
+      );
+  }
+
+  Future<void> _confirmClearHistory() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Clear all history?'),
+        content: const Text('This removes your watch history. '
+            'Your favorites are kept.'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Clear'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed == true) {
+      await _db.clearHistory();
+      await _reload();
+      if (mounted) _snack('History cleared');
+    }
   }
 
   void _snack(String msg) {
@@ -164,14 +313,17 @@ class _HomeScreenState extends State<HomeScreen>
 
   @override
   void dispose() {
+    CastService.instance.passiveDisconnects
+        .removeListener(_onPassiveCastDisconnect);
     _sub?.cancel();
-    _tab.dispose();
     _titleCtrl.dispose();
     _urlCtrl.dispose();
     _uaCtrl.dispose();
     _localPosition.dispose();
     super.dispose();
   }
+
+  // ── UI ────────────────────────────────────────────────────────────────────
 
   @override
   Widget build(BuildContext context) {
@@ -184,7 +336,8 @@ class _HomeScreenState extends State<HomeScreen>
             localPosition: () => _localPosition.value,
           ),
           PopupMenuButton<String>(
-            icon: const Icon(Icons.more_vert, color: Colors.white),
+            tooltip: 'More options',
+            icon: const Icon(Icons.more_vert),
             onSelected: (value) async {
               switch (value) {
                 case 'privacy':
@@ -192,9 +345,7 @@ class _HomeScreenState extends State<HomeScreen>
                       builder: (_) => const PrivacyPolicyScreen()));
                   break;
                 case 'clear':
-                  await _db.clearHistory();
-                  await _reload();
-                  _snack('History cleared');
+                  await _confirmClearHistory();
                   break;
               }
             },
@@ -205,202 +356,143 @@ class _HomeScreenState extends State<HomeScreen>
           ),
         ],
       ),
+      floatingActionButton: FloatingActionButton.extended(
+        onPressed: () => _openAddUrlSheet(),
+        icon: const Icon(Icons.add_link),
+        label: const Text('Add URL'),
+      ),
       body: SafeArea(
         top: false,
-        child: LayoutBuilder(
-          builder: (context, constraints) {
-            final playerHeight =
-                (constraints.maxHeight * 0.32).clamp(150.0, 260.0);
-            return Column(
-              children: [
-                _statusPill(),
-                Padding(
-                  padding: const EdgeInsets.fromLTRB(12, 4, 12, 8),
-                  child: SizedBox(
-                    height: playerHeight,
-                    width: double.infinity,
-                    child: _playerBox(),
-                  ),
-                ),
-                Expanded(child: _sheet()),
-              ],
-            );
-          },
-        ),
-      ),
-    );
-  }
-
-  Widget _statusPill() {
-    final playing = _current != null;
-    final quality = _current?.resolutionLabel ?? 'HD Quality';
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(12, 8, 12, 4),
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-        decoration: BoxDecoration(
-          color: Colors.white.withValues(alpha: 0.18),
-          borderRadius: BorderRadius.circular(12),
-        ),
-        child: Row(
+        child: Column(
           children: [
-            Icon(Icons.circle,
-                size: 10,
-                color: playing ? AppTheme.online : Colors.white),
-            const SizedBox(width: 8),
-            Text(
-              playing ? 'Playing' : 'Ready to Play',
-              style: const TextStyle(
-                  color: Colors.white, fontWeight: FontWeight.w600),
+            _playerStage(),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
+              child: SizedBox(
+                width: double.infinity,
+                child: SegmentedButton<int>(
+                  segments: const [
+                    ButtonSegment(
+                        value: 0,
+                        label: Text('History'),
+                        icon: Icon(Icons.history)),
+                    ButtonSegment(
+                        value: 1,
+                        label: Text('Favorites'),
+                        icon: Icon(Icons.favorite_outline)),
+                  ],
+                  selected: {_contentIndex},
+                  showSelectedIcon: false,
+                  onSelectionChanged: (s) =>
+                      setState(() => _contentIndex = s.first),
+                ),
+              ),
             ),
-            const Spacer(),
-            Text(quality,
-                style: const TextStyle(color: Colors.white70, fontSize: 13)),
+            Expanded(
+              child: IndexedStack(
+                index: _contentIndex,
+                children: [
+                  _listTab(_history, 'No history yet',
+                      'Videos you open will appear here.'),
+                  _listTab(_favorites, 'No favorites yet',
+                      'Tap the heart on any video to save it.'),
+                ],
+              ),
+            ),
           ],
         ),
       ),
     );
   }
 
-  Widget _playerBox() {
-    return ClipRRect(
-      borderRadius: BorderRadius.circular(16),
-      child: Container(
-        color: Colors.black,
-        child: ValueListenableBuilder<CastState>(
-          valueListenable: CastService.instance.state,
-          builder: (context, castState, _) {
-            // While casting, the receiver owns playback — show remote controls
-            // in place of the local player (which is torn down to avoid double
-            // audio).
-            if (castState.isCasting) {
-              return CastMiniController(
-                item: _current,
-                deviceName: castState.deviceName,
-              );
-            }
-            if (_current == null) {
-              return Center(
-                child: Container(
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 18, vertical: 12),
-                  decoration: BoxDecoration(
-                    color: Colors.white10,
-                    borderRadius: BorderRadius.circular(10),
-                  ),
-                  child: const Text(
-                    'ADD OR SELECT VIDEO TO PLAY',
-                    style: TextStyle(
-                        color: Colors.white70,
-                        fontWeight: FontWeight.w600,
-                        letterSpacing: 0.5),
-                  ),
-                ),
-              );
-            }
-            return VideoPlayerView(
-              key: ValueKey(_current!.url),
-              item: _current!,
-              positionSink: _localPosition,
-              onInitialized: (d, s) =>
-                  _onPlayerInitialized(_current!.url, d, s),
-            );
-          },
-        ),
-      ),
+  Widget _playerStage() {
+    return ValueListenableBuilder<CastState>(
+      valueListenable: CastService.instance.state,
+      builder: (context, castState, _) {
+        final Widget child;
+        if (castState.isConnected) {
+          // A cast session is forming or active — the local player MUST be fully
+          // torn down. Gating on isConnected (not just isCasting) means the
+          // local better_player is disposed the instant we start connecting, so
+          // it can't keep decoding audio in the background ("two videos").
+          child = castState.isCasting
+              ? CastMiniController(
+                  key: const ValueKey('cast'),
+                  item: _current,
+                  deviceName: castState.deviceName,
+                )
+              : _castConnecting(castState.deviceName);
+        } else if (_current == null) {
+          child = _idlePoster();
+        } else {
+          child = VideoPlayerView(
+            key: ValueKey(_current!.url),
+            item: _current!,
+            positionSink: _localPosition,
+            onEdit: () => _openAddUrlSheet(_current),
+            onInitialized: (d, s) => _onPlayerInitialized(_current!.url, d, s),
+          );
+        }
+        // NO AnimatedSwitcher: swapping the player must unmount + dispose the
+        // outgoing controller in the SAME frame. A cross-fade keeps the old
+        // VideoPlayerView mounted during the transition, and with
+        // autoDispose:false an interrupted transition orphans a better_player
+        // that keeps playing audio behind the new one (double playback).
+        return Container(
+          width: double.infinity,
+          color: Colors.black,
+          child: AspectRatio(
+            aspectRatio: 16 / 9,
+            child: child,
+          ),
+        );
+      },
     );
   }
 
-  Widget _sheet() {
-    return Container(
-      decoration: const BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
-      ),
+  Widget _castConnecting(String? device) {
+    return Center(
       child: Column(
+        mainAxisSize: MainAxisSize.min,
         children: [
-          const SizedBox(height: 10),
-          Container(
-            margin: const EdgeInsets.symmetric(horizontal: 16),
-            decoration: BoxDecoration(
-              color: const Color(0xFFF3F3F3),
-              borderRadius: BorderRadius.circular(14),
-            ),
-            child: TabBar(
-              controller: _tab,
-              indicator: BoxDecoration(
-                color: AppTheme.tabTint,
-                borderRadius: BorderRadius.circular(14),
-              ),
-              indicatorSize: TabBarIndicatorSize.tab,
-              dividerColor: Colors.transparent,
-              labelColor: AppTheme.primaryRed,
-              unselectedLabelColor: Colors.black54,
-              labelStyle: const TextStyle(
-                  fontWeight: FontWeight.w700, letterSpacing: 0.4),
-              tabs: const [
-                Tab(text: 'PLAYER'),
-                Tab(text: 'HISTORY'),
-                Tab(text: 'FAVORITES'),
-              ],
-            ),
+          const SizedBox(
+            height: 30,
+            width: 30,
+            child: CircularProgressIndicator(
+                strokeWidth: 3, color: Colors.white70),
           ),
-          const SizedBox(height: 6),
-          Expanded(
-            child: TabBarView(
-              controller: _tab,
-              children: [
-                _playerTab(),
-                _listTab(_history, 'No history yet',
-                    'Videos you open will appear here.'),
-                _listTab(_favorites, 'No favorites yet',
-                    'Tap the heart on any video to save it.'),
-              ],
-            ),
+          const SizedBox(height: 12),
+          Text(
+            'Connecting to ${device ?? 'your TV'}…',
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(color: Colors.white70),
           ),
         ],
       ),
     );
   }
 
-  Widget _playerTab() {
-    return SingleChildScrollView(
-      padding: const EdgeInsets.fromLTRB(16, 12, 16, 24),
+  Widget _idlePoster() {
+    return Center(
+      key: const ValueKey('idle'),
       child: Column(
+        mainAxisSize: MainAxisSize.min,
         children: [
-          TextField(
-            controller: _titleCtrl,
-            textInputAction: TextInputAction.next,
-            decoration: const InputDecoration(
-              hintText: 'Video Title',
-              prefixIcon:
-                  Icon(Icons.title, color: AppTheme.primaryRed),
-            ),
+          const Icon(Icons.play_circle_outline,
+              color: Colors.white38, size: 48),
+          const SizedBox(height: 8),
+          const Text(
+            'No video playing',
+            style:
+                TextStyle(color: Colors.white70, fontWeight: FontWeight.w600),
           ),
-          const SizedBox(height: 14),
-          TextField(
-            controller: _urlCtrl,
-            keyboardType: TextInputType.url,
-            textInputAction: TextInputAction.next,
-            decoration: const InputDecoration(
-              hintText: 'Video URL',
-              prefixIcon: Icon(Icons.link, color: AppTheme.primaryRed),
-            ),
-          ),
-          const SizedBox(height: 14),
-          TextField(
-            controller: _uaCtrl,
-            textInputAction: TextInputAction.done,
-            decoration: const InputDecoration(
-              hintText: 'User Agent (Optional)',
-              prefixIcon: Icon(Icons.public, color: AppTheme.primaryRed),
-            ),
-          ),
-          const SizedBox(height: 20),
-          ElevatedButton.icon(
-            onPressed: _saveAndPlay,
-            icon: const Icon(Icons.play_arrow_rounded, size: 26),
-            label: const Text('SAVE AND PLAY'),
+          const SizedBox(height: 2),
+          TextButton.icon(
+            onPressed: () => _openAddUrlSheet(),
+            icon: const Icon(Icons.add_link, color: Colors.white),
+            label:
+                const Text('Add a URL', style: TextStyle(color: Colors.white)),
           ),
         ],
       ),
@@ -408,46 +500,56 @@ class _HomeScreenState extends State<HomeScreen>
   }
 
   Widget _listTab(List<VideoItem> items, String emptyTitle, String emptyBody) {
-    if (items.isEmpty) {
-      return Center(
-        child: Padding(
-          padding: const EdgeInsets.all(24),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const Icon(Icons.video_library_outlined,
-                  size: 54, color: Colors.black26),
-              const SizedBox(height: 12),
-              Text(emptyTitle,
-                  style: const TextStyle(
-                      fontWeight: FontWeight.w600,
-                      fontSize: 16,
-                      color: Colors.black54)),
-              const SizedBox(height: 6),
-              Text(emptyBody,
-                  textAlign: TextAlign.center,
-                  style:
-                      const TextStyle(color: Colors.black38, fontSize: 13)),
-            ],
+    return RefreshIndicator(
+      onRefresh: _reload,
+      child: items.isEmpty
+          ? ListView(
+              physics: const AlwaysScrollableScrollPhysics(),
+              children: [_emptyState(emptyTitle, emptyBody)],
+            )
+          : ListView.builder(
+              physics: const AlwaysScrollableScrollPhysics(),
+              padding: const EdgeInsets.only(top: 4, bottom: 96),
+              itemCount: items.length,
+              itemBuilder: (_, i) {
+                final item = items[i];
+                return HistoryTile(
+                  item: item,
+                  onPlay: () => _play(item),
+                  onToggleFavorite: () => _toggleFavorite(item),
+                  onDelete: () => _delete(item),
+                );
+              },
+            ),
+    );
+  }
+
+  Widget _emptyState(String title, String body) {
+    final scheme = Theme.of(context).colorScheme;
+    final text = Theme.of(context).textTheme;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(24, 72, 24, 24),
+      child: Column(
+        children: [
+          Icon(Icons.video_library_outlined,
+              size: 54, color: scheme.onSurfaceVariant),
+          const SizedBox(height: 12),
+          Text(title,
+              style: text.titleMedium?.copyWith(color: scheme.onSurface)),
+          const SizedBox(height: 6),
+          Text(
+            body,
+            textAlign: TextAlign.center,
+            style: text.bodyMedium?.copyWith(color: scheme.onSurfaceVariant),
           ),
-        ),
-      );
-    }
-    return ListView.builder(
-      padding: const EdgeInsets.symmetric(vertical: 6),
-      itemCount: items.length,
-      itemBuilder: (_, i) {
-        final item = items[i];
-        return HistoryTile(
-          item: item,
-          onPlay: () {
-            _selectItem(item);
-            _play(item);
-          },
-          onToggleFavorite: () => _toggleFavorite(item),
-          onDelete: () => _delete(item),
-        );
-      },
+          const SizedBox(height: 16),
+          FilledButton.tonalIcon(
+            onPressed: () => _openAddUrlSheet(),
+            icon: const Icon(Icons.add_link),
+            label: const Text('Add a URL'),
+          ),
+        ],
+      ),
     );
   }
 }

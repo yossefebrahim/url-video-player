@@ -19,11 +19,16 @@ class VideoPlayerView extends StatefulWidget {
   /// start the TV where the phone left off.
   final ValueNotifier<Duration>? positionSink;
 
+  /// Opens the "Add URL" sheet pre-filled with this item (shown as an
+  /// "Edit URL" affordance on the error state).
+  final VoidCallback? onEdit;
+
   const VideoPlayerView({
     super.key,
     required this.item,
     this.onInitialized,
     this.positionSink,
+    this.onEdit,
   });
 
   @override
@@ -99,16 +104,39 @@ class _VideoPlayerViewState extends State<VideoPlayerView> {
         BetterPlayerConfiguration(
           autoPlay: true,
           fit: BoxFit.contain,
+          aspectRatio: 16 / 9,
+          // Rotating the phone in fullscreen follows the video; the inline
+          // scaffold stays portrait (we do NOT app-lock orientation).
+          autoDetectFullscreenDeviceOrientation: true,
           handleLifecycle: true,
           autoDispose: false,
           allowedScreenSleep: false,
-          errorBuilder: (context, msg) =>
-              _ErrorBox(message: msg ?? 'Playback error', onRetry: _retry),
+          errorBuilder: (context, msg) => _ErrorBox(
+            message: msg ?? 'Playback error',
+            onRetry: _retry,
+            onEdit: widget.onEdit,
+          ),
           controlsConfiguration: const BetterPlayerControlsConfiguration(
+            enablePlayPause: true,
+            enableSkips: true, // ±10s, relative (skipForward/skipBack)
+            forwardSkipTimeInMilliseconds: 10000,
+            backwardSkipTimeInMilliseconds: 10000,
+            enableProgressBar: true,
+            enableProgressBarDrag: true,
+            enableProgressText: true,
+            enableFullscreen: true,
+            enableMute: true,
+            enablePlaybackSpeed: true,
+            enableOverflowMenu: true,
+            enableRetry: true,
+            enablePip: false, // not wired in the manifest
+            enableSubtitles: false,
+            controlBarColor: Colors.black54,
+            iconsColor: Colors.white,
             progressBarPlayedColor: AppTheme.primaryRed,
             progressBarHandleColor: AppTheme.primaryRed,
-            loadingColor: Colors.white,
-            enableSubtitles: false,
+            progressBarBufferedColor: Colors.white38,
+            loadingColor: AppTheme.primaryRed,
           ),
         ),
         betterPlayerDataSource: dataSource,
@@ -167,22 +195,52 @@ class _VideoPlayerViewState extends State<VideoPlayerView> {
   @override
   Widget build(BuildContext context) {
     if (_error != null) {
-      return _ErrorBox(message: _error!, onRetry: _retry);
+      return _ErrorBox(message: _error!, onRetry: _retry, onEdit: widget.onEdit);
     }
     final controller = _controller;
     if (controller == null) {
-      return const Center(
-        child: CircularProgressIndicator(color: Colors.white),
-      );
+      return _LoadingBox(title: widget.item.title);
     }
     return BetterPlayer(controller: controller);
+  }
+}
+
+/// Branded pre-controller loading state (before the player itself renders).
+class _LoadingBox extends StatelessWidget {
+  final String title;
+  const _LoadingBox({required this.title});
+
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const SizedBox(
+            height: 34,
+            width: 34,
+            child: CircularProgressIndicator(
+                strokeWidth: 3, color: AppTheme.primaryRed),
+          ),
+          const SizedBox(height: 12),
+          Text(
+            title.isEmpty ? 'Loading…' : 'Loading “$title”…',
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            textAlign: TextAlign.center,
+            style: const TextStyle(color: Colors.white70, fontSize: 13),
+          ),
+        ],
+      ),
+    );
   }
 }
 
 class _ErrorBox extends StatelessWidget {
   final String message;
   final VoidCallback onRetry;
-  const _ErrorBox({required this.message, required this.onRetry});
+  final VoidCallback? onEdit;
+  const _ErrorBox({required this.message, required this.onRetry, this.onEdit});
 
   @override
   Widget build(BuildContext context) {
@@ -207,10 +265,25 @@ class _ErrorBox extends StatelessWidget {
               style: const TextStyle(color: Colors.white54, fontSize: 12),
             ),
             const SizedBox(height: 12),
-            TextButton.icon(
-              onPressed: onRetry,
-              icon: const Icon(Icons.refresh, color: Colors.white),
-              label: const Text('Retry', style: TextStyle(color: Colors.white)),
+            Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                TextButton.icon(
+                  onPressed: onRetry,
+                  icon: const Icon(Icons.refresh, color: Colors.white),
+                  label: const Text('Retry',
+                      style: TextStyle(color: Colors.white)),
+                ),
+                if (onEdit != null) ...[
+                  const SizedBox(width: 8),
+                  TextButton.icon(
+                    onPressed: onEdit,
+                    icon: const Icon(Icons.edit_outlined, color: Colors.white70),
+                    label: const Text('Edit URL',
+                        style: TextStyle(color: Colors.white70)),
+                  ),
+                ],
+              ],
             ),
           ],
         ),

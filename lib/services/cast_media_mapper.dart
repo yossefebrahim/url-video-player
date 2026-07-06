@@ -23,10 +23,17 @@ enum CastEligibility {
 /// See `docs/cast-to-tv-spec.md` for the honest default-receiver scope.
 class CastMediaMapper {
   /// Classifies [item] for the Cast button's enable/disable + messaging.
+  ///
+  /// ClearKey **CENC DASH** series are now castable via the on-device decrypt
+  /// proxy ([CastService] spins up a local server that decrypts and serves
+  /// clear DASH). Only encrypted streams we can't proxy stay deferred.
   static CastEligibility eligibility(VideoItem item) {
     if (item.mode == PlayerMode.web) return CastEligibility.webMode;
-    if (ClearKeyResolver.resolve(item.url).isEncrypted) {
-      return CastEligibility.drmDeferred;
+    final r = ClearKeyResolver.resolve(item.url);
+    if (r.isEncrypted) {
+      final proxyable = r.keyBytes != null &&
+          (r.format == 'dash' || r.url.toLowerCase().contains('.mpd'));
+      if (!proxyable) return CastEligibility.drmDeferred;
     }
     return CastEligibility.ok;
   }

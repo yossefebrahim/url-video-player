@@ -84,4 +84,21 @@ void main() {
       expect(r.withFormat('hls').url, 'https://h.tld/x/54_42.json?token=a');
     });
   });
+
+  group('keyBytes (for the CENC decrypt proxy)', () {
+    test('decodes the first k to raw 16 bytes', () {
+      final r = ClearKeyResolver.resolve(
+          'https://h.tld/i.mpd###3JiNt9Bxu6h/Jq7rdNagKA:74bp3RHIScabj0+anXgz1g');
+      expect(r.keyBytes, isNotNull);
+      expect(r.keyBytes!.length, 16);
+      // dc988db7d071bba87f26aeeb74d6a028
+      expect(r.keyBytes!.first, 0xdc);
+      expect(r.keyBytes!.last, 0x28);
+      expect(r.withFormat('dash').keyBytes, r.keyBytes); // preserved
+    });
+
+    test('plain URLs have no key bytes', () {
+      expect(ClearKeyResolver.resolve('https://h.tld/a.mp4').keyBytes, isNull);
+    });
+  });
 }

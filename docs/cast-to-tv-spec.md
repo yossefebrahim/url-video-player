@@ -268,4 +268,26 @@ Built and verified on device (Samsung SM-A346E). Deviations from the draft above
 
 **Verified:** Cast button renders; tap opens the picker; CAF mDNS discovery starts (`_googlecast._tcp`) and stops cleanly on close (multicast lock released); empty-state guidance shows; app init + teardown crash-free; `flutter analyze` clean; unit tests green (`cast_media_mapper_test.dart`).
 
-**Not yet verified (needs a Google TV on the Wi-Fi):** actual connect + media load + remote controls + position hand-off. The token'd AES-128 **HEVC** live HLS and **ClearKey** series remain Phase-2 (custom receiver) per Section 3.
+**Not yet verified (needs a Google TV on the Wi-Fi):** actual connect + media load + remote controls + position hand-off.
+
+---
+
+## 13. DRM series casting — on-device decrypt proxy (shipped, replaces the custom receiver)
+
+Instead of a hosted custom CAF receiver (which needs a paid Cast Console registration), ClearKey **CENC DASH** series are now cast via a **local decrypt proxy on the phone**. This needs no sign-up and no hosting.
+
+**How it works**
+1. `ClearKeyResolver` exposes the raw 16-byte content key (`keyBytes`) from the `###k:kid` hand-off.
+2. When casting an encrypted `.mpd`, `CastService` starts `CastProxyServer` (`dart:io HttpServer` bound to the phone's LAN IP) and casts `http://<phone-ip>:<port>/manifest.mpd` to the default receiver.
+3. The Chromecast fetches from the phone. The proxy:
+   - rewrites the manifest — strips `<ContentProtection>`, points every `SegmentTemplate` at the proxy, preserves `SegmentTimeline`;
+   - proxies each init/media segment from the real origin and **decrypts CENC in place** (`CencDecryptor`, pointycastle AES-CTR): renames `encv`→`avc1`/`enca`→`mp4a`, `sinf`/`senc`/`saiz`/`saio`/`sbgp`/`sgpd`/`pssh`→`free` (size-preserving, no offset recompute), and AES-CTR-decrypts `mdat` (subsample-aware for video, whole-sample for audio);
+   - sends CORS headers (the receiver runs in a browser and fetches cross-origin).
+
+This also **transparently solves the User-Agent + token problems**: the phone fetches upstream with the right headers; the TV only ever talks to the phone.
+
+**Validation (desktop, no TV):** the Dart decryptor's output is **byte-identical to ffmpeg `-decryption_key`** (same decoded-frame MD5), audio + video decode cleanly, and **VLC** (a real DASH client, like the Chromecast's Shaka) plays the full pipeline through the proxy end-to-end (h264 + aac). Locked in by known-answer unit tests in `test/cenc_decryptor_test.dart`.
+
+**New files:** `lib/services/cenc_decryptor.dart`, `lib/services/cast_proxy_server.dart` (both pure Dart), `tool/cenc_validate.dart`, `tool/proxy_validate.dart`, `test/fixtures/cenc_video_*.mp4`.
+**Dependency added:** `pointycastle` (pure-Dart AES).
+**Still needs a TV to verify the final on-glass playback.** HEVC-in-TS live (beIN) is a separate codec problem, unchanged by this.

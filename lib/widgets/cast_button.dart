@@ -99,8 +99,7 @@ class CastButton extends StatelessWidget {
           mainAxisSize: MainAxisSize.min,
           children: [
             ListTile(
-              leading: const Icon(Icons.cast_connected,
-                  color: AppTheme.primaryRed),
+              leading: const Icon(Icons.cast_connected),
               title: Text(st.deviceName ?? 'Connected'),
               subtitle: Text(st.isCasting ? 'Casting' : 'Connected'),
             ),
@@ -156,7 +155,7 @@ class _DevicePickerSheet extends StatelessWidget {
               else
                 ...devices.map(
                   (d) => ListTile(
-                    leading: const Icon(Icons.tv, color: AppTheme.primaryRed),
+                    leading: const Icon(Icons.tv),
                     title: Text(d.friendlyName),
                     subtitle: d.modelName != null ? Text(d.modelName!) : null,
                     onTap: () => onDeviceTap(d),
@@ -176,24 +175,28 @@ class _PickerEmptyState extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return const Padding(
-      padding: EdgeInsets.fromLTRB(20, 12, 20, 20),
+    final scheme = Theme.of(context).colorScheme;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(20, 12, 20, 20),
       child: Column(
         children: [
-          SizedBox(
+          const SizedBox(
             height: 28,
             width: 28,
             child: CircularProgressIndicator(strokeWidth: 2.5),
           ),
-          SizedBox(height: 16),
-          Text('Searching for devices…',
-              style: TextStyle(fontWeight: FontWeight.w600)),
-          SizedBox(height: 6),
+          const SizedBox(height: 16),
+          Semantics(
+            liveRegion: true,
+            child: const Text('Searching for devices…',
+                style: TextStyle(fontWeight: FontWeight.w600)),
+          ),
+          const SizedBox(height: 6),
           Text(
             'Make sure your TV and phone are on the same Wi-Fi. '
             'Guest / AP-isolation networks block discovery.',
             textAlign: TextAlign.center,
-            style: TextStyle(color: Colors.black54, fontSize: 13),
+            style: TextStyle(color: scheme.onSurfaceVariant, fontSize: 13),
           ),
         ],
       ),

@@ -25,8 +25,16 @@ void main() {
           CastEligibility.webMode);
     });
 
-    test('ClearKey DASH series is deferred to Phase 2', () {
+    test('ClearKey CENC DASH is castable via the on-device decrypt proxy', () {
       expect(CastMediaMapper.eligibility(_item(_clearKeyUrl)),
+          CastEligibility.ok);
+    });
+
+    test('encrypted but non-DASH (or unparseable key) stays deferred', () {
+      // Valid key but an .m3u8 — not a CENC DASH the proxy rewrites.
+      expect(
+          CastMediaMapper.eligibility(_item(
+              'https://h.tld/x.m3u8###3JiNt9Bxu6h/Jq7rdNagKA:74bp3RHIScabj0+anXgz1g')),
           CastEligibility.drmDeferred);
     });
   });

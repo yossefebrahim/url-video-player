@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 /// A stream URL split into its playable manifest and optional decryption config.
 class ResolvedStream {
@@ -12,13 +13,17 @@ class ResolvedStream {
   /// 'dash' | 'hls' | null (let the player sniff).
   final String? format;
 
-  ResolvedStream(this.url, {this.clearKeyJson, this.format});
+  /// Raw 16-byte content key of the first `k:kid` pair — used by the on-device
+  /// CENC decrypt proxy when casting DRM series. Null if absent/malformed.
+  final Uint8List? keyBytes;
+
+  ResolvedStream(this.url, {this.clearKeyJson, this.format, this.keyBytes});
 
   bool get isEncrypted => clearKeyJson != null;
 
   /// Same stream with the container [format] overridden (used after sniffing).
-  ResolvedStream withFormat(String? format) =>
-      ResolvedStream(url, clearKeyJson: clearKeyJson, format: format);
+  ResolvedStream withFormat(String? format) => ResolvedStream(url,
+      clearKeyJson: clearKeyJson, format: format, keyBytes: keyBytes);
 }
 
 /// Resolves the `<manifestUrl>###<k>:<kid>` scheme used by the t4w ecosystem for
@@ -44,14 +49,31 @@ class ClearKeyResolver {
     var url = rawUrl;
     String? clearKeyJson;
 
+    Uint8List? keyBytes;
     final marker = rawUrl.indexOf('###');
     if (marker >= 0) {
       url = rawUrl.substring(0, marker);
       final keyStr = rawUrl.substring(marker + 3);
       clearKeyJson = _buildClearKeyJson(keyStr);
+      keyBytes = _firstKeyBytes(keyStr);
     }
 
-    return ResolvedStream(url, clearKeyJson: clearKeyJson, format: _formatFromUrl(url));
+    return ResolvedStream(url,
+        clearKeyJson: clearKeyJson,
+        format: _formatFromUrl(url),
+        keyBytes: keyBytes);
+  }
+
+  /// Raw 16-byte content key of the first `k:kid` pair (for the CENC proxy).
+  static Uint8List? _firstKeyBytes(String keyStr) {
+    try {
+      final k = keyStr.split('|').first.split(':').first.trim();
+      final std = k.replaceAll('-', '+').replaceAll('_', '/');
+      final bytes = base64.decode(base64.normalize(std));
+      return bytes.length == 16 ? Uint8List.fromList(bytes) : null;
+    } catch (_) {
+      return null;
+    }
   }
 
   /// Container hint from the URL string alone (null when the extension is opaque).

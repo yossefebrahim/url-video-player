@@ -20,6 +20,8 @@ class UrlVideoPlayerApp extends StatelessWidget {
       title: 'Url Video Player',
       debugShowCheckedModeBanner: false,
       theme: AppTheme.light,
+      darkTheme: AppTheme.dark,
+      themeMode: ThemeMode.dark,
       home: const HomeScreen(),
     );
   }

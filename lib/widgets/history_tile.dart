@@ -1,12 +1,17 @@
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/semantics.dart';
 
 import '../app_theme.dart';
 import '../models/video_item.dart';
 
 /// A single history / favorites row: poster thumbnail, title, URL and the
-/// captured metadata (source, duration, resolution).
+/// captured metadata (source, resolution, relative time).
+///
+/// Tap = play · swipe left = delete (parent shows an Undo snackbar) · trailing
+/// heart toggles favorite. Delete + favorite are also exposed as custom
+/// semantics actions so screen-reader users aren't limited to the swipe.
 class HistoryTile extends StatelessWidget {
   final VideoItem item;
   final VoidCallback onPlay;
@@ -23,39 +28,58 @@ class HistoryTile extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Card(
-      margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-      elevation: 1,
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
-      child: InkWell(
-        borderRadius: BorderRadius.circular(14),
-        onTap: onPlay,
-        child: Padding(
-          padding: const EdgeInsets.all(10),
-          child: Row(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              _Thumbnail(item: item),
-              const SizedBox(width: 12),
-              Expanded(child: _Details(item: item)),
-              Column(
+    final scheme = Theme.of(context).colorScheme;
+    return Dismissible(
+      key: ValueKey(item.url),
+      direction: DismissDirection.endToStart,
+      onDismissed: (_) => onDelete(),
+      background: Container(
+        margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+        decoration: BoxDecoration(
+          color: scheme.error,
+          borderRadius: BorderRadius.circular(AppTheme.rMd),
+        ),
+        alignment: Alignment.centerRight,
+        padding: const EdgeInsets.only(right: 22),
+        child: Icon(Icons.delete_outline, color: scheme.onError),
+      ),
+      child: Semantics(
+        button: true,
+        label: 'Play ${item.title.isEmpty ? 'video' : item.title}',
+        customSemanticsActions: {
+          CustomSemanticsAction(
+            label: item.favorite ? 'Remove from favorites' : 'Add to favorites',
+          ): onToggleFavorite,
+          const CustomSemanticsAction(label: 'Delete'): onDelete,
+        },
+        child: Card(
+          child: InkWell(
+            borderRadius: BorderRadius.circular(AppTheme.rMd),
+            onTap: onPlay,
+            child: Padding(
+              padding: const EdgeInsets.all(10),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
+                  _Thumbnail(item: item),
+                  const SizedBox(width: 12),
+                  Expanded(child: _Details(item: item)),
                   IconButton(
-                    visualDensity: VisualDensity.compact,
                     onPressed: onToggleFavorite,
+                    tooltip: item.favorite
+                        ? 'Remove from favorites'
+                        : 'Add to favorites',
                     icon: Icon(
                       item.favorite ? Icons.favorite : Icons.favorite_border,
-                      color: item.favorite ? AppTheme.primaryRed : Colors.grey,
+                      color: item.favorite
+                          ? AppTheme.primaryRed
+                          : scheme.onSurfaceVariant,
+                      semanticLabel: item.favorite ? 'Favorited' : 'Not favorited',
                     ),
-                  ),
-                  IconButton(
-                    visualDensity: VisualDensity.compact,
-                    onPressed: onDelete,
-                    icon: const Icon(Icons.delete_outline, color: Colors.grey),
                   ),
                 ],
               ),
-            ],
+            ),
           ),
         ),
       ),
@@ -90,9 +114,11 @@ class _Thumbnail extends StatelessWidget {
               )
             else
               _placeholder(),
-            const Center(
-              child: Icon(Icons.play_circle_fill,
-                  color: Colors.white70, size: 26),
+            const ExcludeSemantics(
+              child: Center(
+                child: Icon(Icons.play_circle_fill,
+                    color: Colors.white70, size: 26),
+              ),
             ),
             if (duration != null)
               Positioned(
@@ -116,12 +142,14 @@ class _Thumbnail extends StatelessWidget {
 
   Widget _placeholder() => Container(
         color: Colors.black87,
-        child: Icon(
-          item.mode == PlayerMode.web
-              ? Icons.public
-              : Icons.movie_creation_outlined,
-          color: Colors.white38,
-          size: 28,
+        child: ExcludeSemantics(
+          child: Icon(
+            item.mode == PlayerMode.web
+                ? Icons.public
+                : Icons.movie_creation_outlined,
+            color: Colors.white54,
+            size: 28,
+          ),
         ),
       );
 }
@@ -132,9 +160,13 @@ class _Details extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final text = Theme.of(context).textTheme;
+    final rel = _relativeTime(item.addedAt);
     final meta = <String>[
       item.source,
       ?item.resolutionLabel,
+      if (rel.isNotEmpty) rel,
     ].join('  •  ');
 
     return Column(
@@ -144,15 +176,17 @@ class _Details extends StatelessWidget {
           item.title.isEmpty ? 'Untitled video' : item.title,
           maxLines: 1,
           overflow: TextOverflow.ellipsis,
-          style: const TextStyle(
-              fontWeight: FontWeight.w600, fontSize: 15, color: Colors.black87),
+          style: text.titleMedium?.copyWith(
+            fontWeight: FontWeight.w600,
+            color: scheme.onSurface,
+          ),
         ),
         const SizedBox(height: 3),
         Text(
           item.url,
           maxLines: 1,
           overflow: TextOverflow.ellipsis,
-          style: const TextStyle(fontSize: 12, color: Colors.black45),
+          style: text.bodySmall?.copyWith(color: scheme.onSurfaceVariant),
         ),
         const SizedBox(height: 5),
         Row(
@@ -170,12 +204,26 @@ class _Details extends StatelessWidget {
                 meta,
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
-                style: const TextStyle(fontSize: 11, color: Colors.black54),
+                style: text.labelSmall?.copyWith(color: scheme.onSurfaceVariant),
               ),
             ),
           ],
         ),
       ],
     );
+  }
+
+  /// Compact relative time from an epoch-millis timestamp ("2h ago").
+  static String _relativeTime(int epochMs) {
+    if (epochMs <= 0) return '';
+    final diff =
+        DateTime.now().difference(DateTime.fromMillisecondsSinceEpoch(epochMs));
+    if (diff.inMinutes < 1) return 'just now';
+    if (diff.inMinutes < 60) return '${diff.inMinutes}m ago';
+    if (diff.inHours < 24) return '${diff.inHours}h ago';
+    if (diff.inDays < 7) return '${diff.inDays}d ago';
+    if (diff.inDays < 30) return '${(diff.inDays / 7).floor()}w ago';
+    if (diff.inDays < 365) return '${(diff.inDays / 30).floor()}mo ago';
+    return '${(diff.inDays / 365).floor()}y ago';
   }
 }

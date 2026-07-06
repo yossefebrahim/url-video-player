@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VP Cast Receiver</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+    cast-media-player { --background-color: #000; --splash-image: none; }
+    /* On-screen debug overlay so we can see what the TV is doing without a
+       remote inspector. Toggled off once playback is confirmed working. */
+    #log {
+      position: fixed; left: 0; bottom: 0; right: 0; max-height: 42%;
+      overflow: hidden; margin: 0; padding: 8px 12px;
+      font: 13px/1.35 monospace; color: #9fe; background: rgba(0,0,0,0.55);
+      white-space: pre-wrap; z-index: 9999; pointer-events: none;
+    }
+  </style>
+  <script src="https://www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
+</head>
+<body>
+  <cast-media-player></cast-media-player>
+  <pre id="log">VP receiver booting…</pre>
+
+  <script>
+    const logEl = document.getElementById('log');
+    const lines = [];
+
+    // Everything logged on-screen is also POSTed to the phone proxy's /beacon
+    // endpoint (LAN http; Cast receivers exempt LAN media/XHR from mixed-
+    // content blocking), so the phone's logcat sees the TV-side truth — the
+    // HEVC capability probe and any player error — without a TV screen-grab.
+    // The beacon URL arrives in the LOAD request (customData.beacon, or the
+    // origin of a proxied contentId); lines logged before that are queued.
+    let beaconUrl = null;
+    const pending = [];
+    function beacon(line) {
+      pending.push(line);
+      if (!beaconUrl) return;
+      const body = pending.splice(0).join('\n');
+      try {
+        fetch(beaconUrl, { method: 'POST', body: body }).catch(() => {});
+      } catch (e) {}
+    }
+    function log(msg) {
+      const t = new Date().toISOString().substr(11, 8);
+      lines.push('[' + t + '] ' + msg);
+      while (lines.length > 14) lines.shift();
+      logEl.textContent = lines.join('\n');
+      beacon(msg);
+    }
+
+    const context = cast.framework.CastReceiverContext.getInstance();
+    const playerManager = context.getPlayerManager();
+
+    // Announce the exact codec support the device (your Google TV) reports, so
+    // we can confirm HEVC is actually available on the receiver hardware.
+    try {
+      const cd = cast.framework.system.DeviceCapabilities;
+      log('device caps: ' + JSON.stringify(context.getDeviceCapabilities() || {}));
+    } catch (e) {}
+    try {
+      const v = document.createElement('video');
+      log('canPlay hvc1(fMP4): ' + v.canPlayType('video/mp4; codecs="hvc1.1.6.L120.90"'));
+      log('canPlay hev1(fMP4): ' + v.canPlayType('video/mp4; codecs="hev1.1.6.L120.90"'));
+      log('MSE hvc1: ' + (window.MediaSource &&
+        MediaSource.isTypeSupported('video/mp4; codecs="hvc1.1.6.L120.90"')));
+    } catch (e) { log('caps probe failed: ' + e); }
+
+    const opts = new cast.framework.CastReceiverOptions();
+    opts.disableIdleTimeout = true;
+    // Route HLS through Shaka instead of the legacy MPL: Shaka's TS transmuxer
+    // handles H.265, which is the whole reason these live channels exist here.
+    opts.useShakaForHls = true;
+
+    // LOAD interceptor: log what the sender asked us to play, and pick up the
+    // beacon target (customData.beacon from the app, else the phone-proxy
+    // origin when the contentId already points at the phone).
+    playerManager.setMessageInterceptor(
+      cast.framework.messages.MessageType.LOAD,
+      (request) => {
+        try {
+          const m = request.media || {};
+          const url = m.contentId || m.contentUrl || '';
+          const custom = m.customData || {};
+          if (custom.beacon) {
+            beaconUrl = custom.beacon;
+          } else if (/^http:\/\//.test(url)) {
+            beaconUrl = new URL('/beacon', url).toString();
+          }
+          log('LOAD ' + (m.contentType || '?') + '  ' + (url || '?'));
+        } catch (e) { log('LOAD (unparseable): ' + e); }
+        return request;
+      });
+
+    playerManager.addEventListener(
+      cast.framework.events.EventType.PLAYER_LOAD_COMPLETE,
+      () => log('PLAYER_LOAD_COMPLETE'));
+    playerManager.addEventListener(
+      cast.framework.events.EventType.PLAYING, () => log('PLAYING ✓'));
+    playerManager.addEventListener(
+      cast.framework.events.EventType.BUFFERING,
+      (e) => log('BUFFERING isBuffering=' + e.isBuffering));
+    playerManager.addEventListener(
+      cast.framework.events.EventType.ERROR,
+      (e) => {
+        let detail = '';
+        try { detail = JSON.stringify(e.error || {}).slice(0, 300); } catch (x) {}
+        log('ERROR code=' + e.detailedErrorCode + ' reason=' + (e.reason || '') +
+            (detail && detail !== '{}' ? ' ' + detail : ''));
+      });
+    playerManager.addEventListener(
+      cast.framework.events.EventType.MEDIA_STATUS,
+      (e) => {
+        const s = e.mediaStatus || {};
+        // Only log state transitions to keep the overlay readable.
+        if (s.playerState && s.playerState !== window.__last) {
+          window.__last = s.playerState;
+          log('state=' + s.playerState);
+        }
+      });
+
+    context.start(opts);
+    log('receiver started; waiting for LOAD…');
+  </script>
+</body>
+</html>
