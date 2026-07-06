@@ -9,11 +9,13 @@ import '../services/deep_link_service.dart';
 import '../services/history_database.dart';
 import '../services/link_parser.dart';
 import '../services/metadata_service.dart';
+import '../services/platform_info.dart';
 import '../widgets/cast_button.dart';
 import '../widgets/cast_mini_controller.dart';
 import '../widgets/history_tile.dart';
 import '../widgets/video_player_view.dart';
 import 'privacy_policy_screen.dart';
+import 'tv_player_screen.dart';
 import 'web_player_screen.dart';
 
 class HomeScreen extends StatefulWidget {
@@ -37,6 +39,11 @@ class _HomeScreenState extends State<HomeScreen> {
   int _contentIndex = 0; // 0 = History, 1 = Favorites
   StreamSubscription<ParsedLink>? _sub;
 
+  /// Android TV / Google TV. Null until resolved. On TV the home UI is never
+  /// shown — the app is a pure Ostora-hand-off → fullscreen player — so the
+  /// touch UI only renders once this is known to be `false` (a phone).
+  bool? _isTv;
+
   /// Kept current by the local player; read when starting a Cast hand-off.
   final _localPosition = ValueNotifier<Duration>(Duration.zero);
 
@@ -50,6 +57,11 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _initDeepLinks() async {
+    // Resolve device type before handling the cold-start link so the very first
+    // Ostora hand-off routes to the correct player (inline vs fullscreen TV),
+    // and so the touch home UI never flashes on a TV.
+    final isTv = await PlatformInfo.isTv();
+    if (mounted) setState(() => _isTv = isTv);
     try {
       final initial = await DeepLinkService.instance.getInitialLink();
       if (initial != null && mounted) _handleLink(initial);
@@ -105,6 +117,24 @@ class _HomeScreenState extends State<HomeScreen> {
       Navigator.of(context).push(
         MaterialPageRoute(builder: (_) => WebPlayerScreen(item: item)),
       );
+      return;
+    }
+    if (_isTv == true) {
+      // TV: open the fullscreen, remote-controlled player. Pop any existing
+      // player route first (a channel-zap hand-off must not stack a second
+      // player — that would leave two decoders running / double audio). The
+      // popped route's VideoPlayerView force-disposes its controller.
+      final nav = Navigator.of(context);
+      nav.popUntil((r) => r.isFirst);
+      nav.push(
+        MaterialPageRoute(
+          builder: (_) => TvPlayerScreen(
+            item: item,
+            onInitialized: (d, s) => _onPlayerInitialized(item.url, d, s),
+          ),
+        ),
+      );
+      _enrichThumbnail(item);
       return;
     }
     setState(() => _current = item);
@@ -332,6 +362,29 @@ class _HomeScreenState extends State<HomeScreen> {
 
   @override
   Widget build(BuildContext context) {
+    // On a TV this app is a pure Ostora-hand-off → fullscreen player. Never show
+    // the touch home UI (history/favorites/URL form): stay a black surface that
+    // the pushed TvPlayerScreen covers. While the device type is still resolving
+    // (_isTv == null) also stay black so the touch UI can't flash on a TV.
+    final isTv = _isTv;
+    if (isTv != false) {
+      return Scaffold(
+        backgroundColor: Colors.black,
+        body: isTv == null
+            ? const SizedBox.shrink()
+            : const Center(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(Icons.live_tv_rounded, color: Colors.white24, size: 72),
+                    SizedBox(height: 16),
+                    Text('Open a channel from Ostora',
+                        style: TextStyle(color: Colors.white38, fontSize: 18)),
+                  ],
+                ),
+              ),
+      );
+    }
     return Scaffold(
       appBar: AppBar(
         title: const Text('Url Video Player'),

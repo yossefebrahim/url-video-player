@@ -24,12 +24,39 @@ class VideoPlayerView extends StatefulWidget {
   /// "Edit URL" affordance on the error state).
   final VoidCallback? onEdit;
 
+  /// Called with the player controller once it's ready (and again after a
+  /// retry recreates it). Lets a host screen — e.g. the fullscreen TV player —
+  /// drive play/pause/seek/track selection from the remote without duplicating
+  /// this widget's controller setup.
+  final void Function(BetterPlayerController controller)? onControllerReady;
+
+  /// TV mode: the host provides its own fullscreen surface and D-pad controls,
+  /// so the built-in touch controls (fullscreen button + tap-only overflow /
+  /// quality menu, and a competing fullscreen route) are suppressed.
+  final bool tvMode;
+
+  /// In [tvMode], the aspect ratio of the fullscreen surface the player fills.
+  /// Passed so the video box matches the real screen (contain letterboxes,
+  /// cover fills) — a null ratio makes better_player fall back to a hardcoded
+  /// 16:9 box that mis-fills non-16:9 / PiP / multi-window surfaces.
+  final double? screenAspectRatio;
+
+  /// Called when the error state changes (setup failure or a mid-playback
+  /// `exception`, and cleared on (re)load / `initialized`). Lets the TV host
+  /// show a remote-reachable retry and auto-reconnect live streams, since the
+  /// built-in touch error box isn't D-pad focusable.
+  final void Function(bool hasError)? onErrorChanged;
+
   const VideoPlayerView({
     super.key,
     required this.item,
     this.onInitialized,
     this.positionSink,
     this.onEdit,
+    this.onControllerReady,
+    this.tvMode = false,
+    this.screenAspectRatio,
+    this.onErrorChanged,
   });
 
   @override
@@ -64,6 +91,7 @@ class _VideoPlayerViewState extends State<VideoPlayerView> {
   Future<void> _setUp() async {
     final gen = ++_generation;
     setState(() => _error = null);
+    widget.onErrorChanged?.call(false);
 
     try {
       var resolved = ClearKeyResolver.resolve(widget.item.url);
@@ -111,11 +139,15 @@ class _VideoPlayerViewState extends State<VideoPlayerView> {
             : null,
       );
 
+      final tv = widget.tvMode;
       final controller = BetterPlayerController(
         BetterPlayerConfiguration(
           autoPlay: true,
           fit: BoxFit.contain,
-          aspectRatio: 16 / 9,
+          // TV: size the box to the real screen so contain/cover fill correctly
+          // (falling back to 16:9 only if the host didn't supply a ratio).
+          // Inline (phone) keeps the fixed 16:9 box.
+          aspectRatio: tv ? (widget.screenAspectRatio ?? 16 / 9) : 16 / 9,
           // Rotating the phone in fullscreen follows the video; the inline
           // scaffold stays portrait (we do NOT app-lock orientation).
           autoDetectFullscreenDeviceOrientation: true,
@@ -127,7 +159,7 @@ class _VideoPlayerViewState extends State<VideoPlayerView> {
             onRetry: _retry,
             onEdit: widget.onEdit,
           ),
-          controlsConfiguration: const BetterPlayerControlsConfiguration(
+          controlsConfiguration: BetterPlayerControlsConfiguration(
             enablePlayPause: true,
             enableSkips: true, // ±10s, relative (skipForward/skipBack)
             forwardSkipTimeInMilliseconds: 10000,
@@ -135,10 +167,15 @@ class _VideoPlayerViewState extends State<VideoPlayerView> {
             enableProgressBar: true,
             enableProgressBarDrag: true,
             enableProgressText: true,
-            enableFullscreen: true,
+            // TV: we own the fullscreen surface + a D-pad-focusable quality
+            // menu; the plugin's fullscreen route and tap-only overflow menu
+            // would fight us, so they're off.
+            enableFullscreen: !tv,
             enableMute: true,
-            enablePlaybackSpeed: true,
-            enableOverflowMenu: true,
+            enablePlaybackSpeed: !tv,
+            enableOverflowMenu: !tv,
+            enableQualities: !tv,
+            showControlsOnInitialize: !tv,
             enableRetry: true,
             enablePip: false, // not wired in the manifest
             enableSubtitles: false,
@@ -165,11 +202,16 @@ class _VideoPlayerViewState extends State<VideoPlayerView> {
                 value.size ?? Size.zero,
               );
             }
+            widget.onErrorChanged?.call(false);
             WakelockCoordinator.instance.acquire(this);
           case BetterPlayerEventType.progress:
             final position = controller.videoPlayerController?.value.position;
             if (position != null) widget.positionSink?.value = position;
           case BetterPlayerEventType.exception:
+            // A mid-playback failure (common on these live streams: token
+            // expiry, dropped segment). Tell the TV host so it can reconnect.
+            widget.onErrorChanged?.call(true);
+            WakelockCoordinator.instance.release(this);
           case BetterPlayerEventType.finished:
             // Playback stopped after initializing (stream died mid-play, or
             // ended). better_player renders its own error/end UI inside this
@@ -182,13 +224,18 @@ class _VideoPlayerViewState extends State<VideoPlayerView> {
       });
 
       if (_isStale(gen)) {
-        controller.dispose();
+        controller.dispose(forceDispose: true);
         return;
       }
       setState(() => _controller = controller);
+      // Hand the ready controller to a host (TV screen) so it can drive the
+      // remote. Fired after the stale re-check so a stale controller is never
+      // exposed; re-fires on retry (a fresh controller is built each time).
+      widget.onControllerReady?.call(controller);
     } catch (e) {
       if (_isStale(gen)) return;
       setState(() => _error = e.toString());
+      widget.onErrorChanged?.call(true);
     }
   }
 
@@ -201,7 +248,10 @@ class _VideoPlayerViewState extends State<VideoPlayerView> {
 
   void _teardown() {
     _generation++;
-    _controller?.dispose();
+    // forceDispose: the controller is built with autoDispose:false, so a plain
+    // dispose() is a no-op and would leave the native ExoPlayer decoding (audio
+    // continuing after the view is gone). Force it to actually release.
+    _controller?.dispose(forceDispose: true);
     _controller = null;
     WakelockCoordinator.instance.release(this);
   }

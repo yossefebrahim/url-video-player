@@ -1,6 +1,9 @@
 package info.t4w.vp
 
+import android.app.UiModeManager
+import android.content.Context
 import android.content.Intent
+import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.media.MediaMetadataRetriever
 import android.net.Uri
@@ -45,6 +48,17 @@ class MainActivity : FlutterActivity() {
                         // Deliver the cold-start link only once so hot restarts
                         // don't replay it.
                         initialLink = null
+                    }
+                    "isTv" -> {
+                        // Android TV / Google TV: either the system reports a TV
+                        // UI mode, or the device advertises the leanback feature.
+                        val uiModeManager =
+                            getSystemService(Context.UI_MODE_SERVICE) as UiModeManager
+                        val isTelevision = uiModeManager.currentModeType ==
+                            Configuration.UI_MODE_TYPE_TELEVISION
+                        val hasLeanback = packageManager
+                            .hasSystemFeature("android.software.leanback")
+                        result.success(isTelevision || hasLeanback)
                     }
                     "generateThumbnail" -> {
                         val url = call.argument<String>("url")

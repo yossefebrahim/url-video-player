@@ -5,6 +5,12 @@
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/>
     <uses-permission android:name="android.permission.WAKE_LOCK"/>
 
+    <!-- Android TV / Google TV: the app works with a D-pad and without a
+         touchscreen, so it stays installable on TVs (which have neither a
+         touchscreen nor, necessarily, the leanback UI). -->
+    <uses-feature android:name="android.software.leanback" android:required="false"/>
+    <uses-feature android:name="android.hardware.touchscreen" android:required="false"/>
+
     <application
         android:label="Url Video Player"
         android:name="${applicationName}"
