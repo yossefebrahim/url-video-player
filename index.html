@@ -25,11 +25,29 @@
   <script>
     const logEl = document.getElementById('log');
     const lines = [];
+
+    // Everything logged on-screen is also POSTed to the phone proxy's /beacon
+    // endpoint (LAN http; Cast receivers exempt LAN media/XHR from mixed-
+    // content blocking), so the phone's logcat sees the TV-side truth — the
+    // HEVC capability probe and any player error — without a TV screen-grab.
+    // The beacon URL arrives in the LOAD request (customData.beacon, or the
+    // origin of a proxied contentId); lines logged before that are queued.
+    let beaconUrl = null;
+    const pending = [];
+    function beacon(line) {
+      pending.push(line);
+      if (!beaconUrl) return;
+      const body = pending.splice(0).join('\n');
+      try {
+        fetch(beaconUrl, { method: 'POST', body: body }).catch(() => {});
+      } catch (e) {}
+    }
     function log(msg) {
       const t = new Date().toISOString().substr(11, 8);
       lines.push('[' + t + '] ' + msg);
       while (lines.length > 14) lines.shift();
       logEl.textContent = lines.join('\n');
+      beacon(msg);
     }
 
     const context = cast.framework.CastReceiverContext.getInstance();
@@ -49,18 +67,28 @@
         MediaSource.isTypeSupported('video/mp4; codecs="hvc1.1.6.L120.90"')));
     } catch (e) { log('caps probe failed: ' + e); }
 
-    // Let CAF/Shaka try transmuxing TS if it needs to.
     const opts = new cast.framework.CastReceiverOptions();
     opts.disableIdleTimeout = true;
+    // Route HLS through Shaka instead of the legacy MPL: Shaka's TS transmuxer
+    // handles H.265, which is the whole reason these live channels exist here.
+    opts.useShakaForHls = true;
 
-    // LOAD interceptor: log what the sender asked us to play and make sure the
-    // contentType routes to the adaptive (HLS/DASH) pipeline.
+    // LOAD interceptor: log what the sender asked us to play, and pick up the
+    // beacon target (customData.beacon from the app, else the phone-proxy
+    // origin when the contentId already points at the phone).
     playerManager.setMessageInterceptor(
       cast.framework.messages.MessageType.LOAD,
       (request) => {
         try {
           const m = request.media || {};
-          log('LOAD ' + (m.contentType || '?') + '  ' + (m.contentId || m.contentUrl || '?'));
+          const url = m.contentId || m.contentUrl || '';
+          const custom = m.customData || {};
+          if (custom.beacon) {
+            beaconUrl = custom.beacon;
+          } else if (/^http:\/\//.test(url)) {
+            beaconUrl = new URL('/beacon', url).toString();
+          }
+          log('LOAD ' + (m.contentType || '?') + '  ' + (url || '?'));
         } catch (e) { log('LOAD (unparseable): ' + e); }
         return request;
       });
@@ -75,7 +103,12 @@
       (e) => log('BUFFERING isBuffering=' + e.isBuffering));
     playerManager.addEventListener(
       cast.framework.events.EventType.ERROR,
-      (e) => log('ERROR code=' + e.detailedErrorCode + ' reason=' + (e.reason || '')));
+      (e) => {
+        let detail = '';
+        try { detail = JSON.stringify(e.error || {}).slice(0, 300); } catch (x) {}
+        log('ERROR code=' + e.detailedErrorCode + ' reason=' + (e.reason || '') +
+            (detail && detail !== '{}' ? ' ' + detail : ''));
+      });
     playerManager.addEventListener(
       cast.framework.events.EventType.MEDIA_STATUS,
       (e) => {
