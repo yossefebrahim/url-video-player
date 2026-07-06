@@ -6,6 +6,7 @@ import 'dart:typed_data';
 import 'package:pointycastle/export.dart';
 
 import 'cenc_decryptor.dart';
+import 'hls_key_decryptor.dart';
 import 'hls_rewriter.dart';
 
 /// Debug-only logger (keeps this file free of a Flutter dependency so it stays
@@ -434,18 +435,46 @@ class HlsCastProxy extends CastProxy {
     // Validate EVERY client-supplied host before any upstream fetch, so a bad
     // key can't be masked by the segment fetch happening first.
     if (u == null || !_isAllowed(u)) return _forbidden(res);
-    if (decrypting && !_isAllowed(keyParam)) return _forbidden(res);
+
+    // Decode the key reference once. An inline `data:` key (the obfuscated
+    // beIN/nazika live channels) is ENC:-wrapped and self-contained: it's
+    // unwrapped locally, never fetched, so it carries no SSRF risk and skips
+    // the host allow-list. Any http(s) key URL must resolve to a host we
+    // referenced while rewriting a real upstream playlist.
+    String? keyUrl;
+    if (decrypting) {
+      keyUrl = HlsRewriter.decodeUrl(keyParam);
+      if (!keyUrl.startsWith('data:') && !_isAllowed(keyParam)) {
+        return _forbidden(res);
+      }
+    }
 
     var bytes = await fetchBytes(HlsRewriter.decodeUrl(u));
-    if (decrypting) {
-      final keyUrl = HlsRewriter.decodeUrl(keyParam);
-      final key = _keys[keyUrl] ??= await _fetchKey(keyUrl);
+    if (keyUrl != null && iv != null) {
+      final key = _keys[keyUrl] ??= await _resolveKey(keyUrl);
       bytes = decryptAes128Cbc(key, iv, bytes);
     }
 
     res.headers.contentType = ContentType('video', 'mp2t');
     res.add(bytes);
     await res.close();
+  }
+
+  /// Resolves an AES-128 key reference to its raw 16 key bytes. An inline
+  /// `data:` URI (the obfuscated beIN/nazika live channels) is ENC:-wrapped and
+  /// can't be fetched over HTTP, so it's unwrapped locally via [HlsKeyDecryptor]
+  /// — the same path the local player uses ([LiveHlsProxy]). Every other
+  /// reference is an origin key URL fetched with the session headers.
+  Future<Uint8List> _resolveKey(String keyUrl) async {
+    if (keyUrl.startsWith('data:')) {
+      final key = HlsKeyDecryptor.keyFromUri(keyUrl);
+      if (key == null || key.length != 16) {
+        throw StateError(
+            'inline data: key did not resolve to a 16-byte AES key');
+      }
+      return key;
+    }
+    return _fetchKey(keyUrl);
   }
 
   Future<Uint8List> _fetchKey(String url) async {

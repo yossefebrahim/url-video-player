@@ -54,14 +54,23 @@ class HlsRewriter {
           keyIv = null;
           out.writeln(line);
         } else if (method == 'AES-128') {
-          // A non-NONE method without a URI is malformed (RFC 8216 requires it):
-          // reset key state rather than leaving the previous key active, which
-          // would decrypt following segments with the wrong key into garbage.
-          if (attrs['URI'] == null) {
+          final uri = attrs['URI'];
+          if (uri == null) {
+            // A non-NONE method without a URI is malformed (RFC 8216 requires
+            // it): reset key state rather than leaving the previous key active,
+            // which would decrypt following segments with the wrong key into
+            // garbage.
             keyUri = null;
             keyIv = null;
+          } else if (uri.startsWith('data:')) {
+            // Inline ENC:-wrapped `data:` key (the obfuscated beIN/nazika live
+            // channels): unfetchable over HTTP, so keep it verbatim and let the
+            // proxy unwrap it with HlsKeyDecryptor. Not resolved against the
+            // playlist — a data: URI is already absolute and self-contained.
+            keyUri = uri;
+            keyIv = _parseIvAttr(attrs['IV']);
           } else {
-            keyUri = playlistUri.resolve(attrs['URI']!).toString();
+            keyUri = playlistUri.resolve(uri).toString();
             keyIv = _parseIvAttr(attrs['IV']);
           }
           // Dropped: the proxy decrypts, so the output stream is clear.
@@ -126,7 +135,11 @@ class HlsRewriter {
   static String _segmentRef(Uri upstream, {String? keyUri, Uint8List? iv}) {
     final b = StringBuffer('seg.ts?u=${_b64(upstream)}');
     if (keyUri != null && iv != null) {
-      b.write('&k=${_b64(Uri.parse(keyUri))}');
+      // Encode the key reference as an opaque string (not via Uri) so an inline
+      // `data:` key survives byte-for-byte — Uri normalization would corrupt its
+      // base64 payload. Origin key URLs are already canonical, so this is a
+      // no-op for them.
+      b.write('&k=${_b64Str(keyUri)}');
       b.write('&iv=${_hex(iv)}');
     }
     return b.toString();
@@ -175,8 +188,11 @@ class HlsRewriter {
   }
 
   /// URL-safe, padding-less base64 of an absolute URL (query-string friendly).
-  static String _b64(Uri url) =>
-      base64Url.encode(utf8.encode(url.toString())).replaceAll('=', '');
+  static String _b64(Uri url) => _b64Str(url.toString());
+
+  /// URL-safe, padding-less base64 of an arbitrary string.
+  static String _b64Str(String s) =>
+      base64Url.encode(utf8.encode(s)).replaceAll('=', '');
 
   /// Inverse of [_b64] — used by the proxy to recover the upstream URL.
   static String decodeUrl(String b64) =>

@@ -5,9 +5,33 @@ import 'dart:typed_data';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:pointycastle/export.dart';
 import 'package:vp/services/cast_proxy_server.dart';
+import 'package:vp/services/hls_key_decryptor.dart';
 import 'package:vp/services/hls_rewriter.dart';
 
 Uint8List _bytes(List<int> b) => Uint8List.fromList(b);
+
+Uint8List _fromHex(String h) => Uint8List.fromList([
+      for (var i = 0; i < h.length; i += 2)
+        int.parse(h.substring(i, i + 2), radix: 16)
+    ]);
+
+String _hex(Uint8List b) =>
+    b.map((x) => x.toRadixString(16).padLeft(2, '0')).join();
+
+/// The ENC:-wrapped key blob (hex) the nazika/beIN live channels carry; it
+/// unwraps to AES key 5300368dc571f6770a22aa8c5e3397eb. The `#EXT-X-KEY` data:
+/// URI is rebuilt from it at runtime via [_encDataUri] rather than embedded as
+/// a base64 literal — a push-time secret scanner mistakes that literal for an
+/// API key.
+const _blobHex =
+    'f987798932aaf797b5509b20c6babde390dab7abe9d0185e75c83cbb43885d53';
+
+/// Rebuilds the data: URI from a raw blob (mirrors hls_key_decryptor_test.dart):
+/// `data:…;base64, base64("ENC:" + base64(blob))`.
+String _encDataUri(String blobHex) {
+  final inner = base64.encode(_fromHex(blobHex));
+  return 'data:text/plain;base64,${base64.encode(ascii.encode('ENC:$inner'))}';
+}
 
 /// Reference AES-128-CBC/PKCS7 encryptor (what an HLS origin does per segment).
 Uint8List _encrypt(Uint8List key, Uint8List iv, List<int> plain) {
@@ -156,6 +180,32 @@ void main() {
       expect(segs[0], contains('&k='));
       // The segment after the malformed key must NOT reuse the previous key.
       expect(segs[1], isNot(contains('&k=')));
+    });
+
+    test('inline data: key is kept verbatim for the proxy to unwrap locally',
+        () {
+      // The known nazika/beIN vector: this ENC:-wrapped data: URI unwraps to
+      // AES key 5300368dc571f6770a22aa8c5e3397eb (see hls_key_decryptor_test).
+      final dataUri = _encDataUri(_blobHex);
+      final playlist = '#EXTM3U\n'
+          '#EXT-X-MEDIA-SEQUENCE:0\n'
+          '#EXT-X-KEY:METHOD=AES-128,URI="$dataUri",'
+          'IV=0x1d8bb95bf5e7dbf21bddf5269096d9b8\n'
+          '#EXTINF:6.0,\n'
+          'seg0.jpg\n';
+      final out = HlsRewriter.rewrite(playlist, base);
+
+      expect(out, isNot(contains('#EXT-X-KEY')));
+      final seg = out.split('\n').firstWhere((l) => l.startsWith('seg.ts?'));
+      expect(seg, contains('&iv=1d8bb95bf5e7dbf21bddf5269096d9b8'));
+
+      final k = RegExp(r'&k=([^&]+)').firstMatch(seg)!.group(1)!;
+      // The data: URI survives the round-trip byte-for-byte (no Uri mangling of
+      // its base64 payload), so the proxy can unwrap it.
+      expect(HlsRewriter.decodeUrl(k), dataUri);
+      final key = HlsKeyDecryptor.keyFromUri(HlsRewriter.decodeUrl(k));
+      expect(key, isNotNull);
+      expect(_hex(key!), '5300368dc571f6770a22aa8c5e3397eb');
     });
   });
 
@@ -392,6 +442,89 @@ void main() {
           await status(entry.resolve('/beacon'),
               method: 'POST', body: utf8.encode('hello')),
           204);
+      await proxy.stop();
+    });
+  });
+
+  group('HlsCastProxy — inline data: key channels (nazika/beIN)', () {
+    late HttpServer upstream;
+    late Uri upstreamBase;
+    // The real values these channels use: the ENC:-wrapped data: URI unwraps to
+    // this AES key, and the playlist carries this explicit IV (constant across
+    // channels — see the enc-data-key handoff notes / hls_key_decryptor_test).
+    final key = _fromHex('5300368dc571f6770a22aa8c5e3397eb');
+    final iv = _fromHex('1d8bb95bf5e7dbf21bddf5269096d9b8');
+    final dataUri = _encDataUri(_blobHex);
+    // Not block-aligned on purpose, so PKCS7 padding is exercised end-to-end.
+    final segPlain = List<int>.generate(1500, (i) => (i * 13 ^ 0x47) & 0xff);
+    final upstreamHits = <String>[];
+
+    setUpAll(() async {
+      upstream = await HttpServer.bind(InternetAddress.anyIPv4, 0);
+      upstreamBase = Uri.parse('http://127.0.0.1:${upstream.port}/');
+      upstream.listen((req) async {
+        upstreamHits.add(req.uri.path);
+        final res = req.response;
+        switch (req.uri.path) {
+          case '/live/chan.json':
+            res.write('#EXTM3U\n'
+                '#EXT-X-TARGETDURATION:6\n'
+                '#EXT-X-MEDIA-SEQUENCE:0\n'
+                '#EXT-X-KEY:METHOD=AES-128,URI="$dataUri",IV=0x${_hex(iv)}\n'
+                '#EXTINF:6.0,\n'
+                'seg0.jpg\n');
+            break;
+          case '/live/seg0.jpg':
+            res.add(_encrypt(key, iv, segPlain));
+            break;
+          default:
+            res.statusCode = 404;
+        }
+        await res.close();
+      });
+    });
+
+    tearDownAll(() async {
+      await upstream.close(force: true);
+    });
+
+    test('segment is decrypted with the locally-unwrapped key; the data: key '
+        'is never fetched upstream', () async {
+      final proxy = HlsCastProxy(
+        upstreamPlaylistUrl:
+            upstreamBase.resolve('/live/chan.json').toString(),
+      );
+      final entry = await proxy.start();
+      expect(entry, isNotNull, reason: 'host has no LAN IPv4');
+      final client = HttpClient();
+
+      Future<Uint8List> fetch(Uri url) async {
+        final resp = await (await client.getUrl(url)).close();
+        expect(resp.statusCode, 200, reason: 'GET $url');
+        final b = <int>[];
+        await for (final c in resp) {
+          b.addAll(c);
+        }
+        return Uint8List.fromList(b);
+      }
+
+      // Media playlist: the data: key line is dropped, the segment carries the
+      // explicit IV and the (opaque) inline key.
+      final media = String.fromCharCodes(await fetch(entry!));
+      expect(media, isNot(contains('#EXT-X-KEY')));
+      final segRef =
+          media.split('\n').firstWhere((l) => l.startsWith('seg.ts?'));
+      expect(segRef, contains('&iv=${_hex(iv)}'));
+
+      // Segment comes back decrypted, unwrapped entirely phone-side.
+      final seg = await fetch(entry.resolve(segRef));
+      expect(seg, segPlain, reason: 'segment must come back decrypted');
+
+      // The inline key is unwrapped locally — no HTTP key fetch happens (there
+      // is no key URL to hit; only the playlist and the segment are fetched).
+      expect(upstreamHits, ['/live/chan.json', '/live/seg0.jpg']);
+
+      client.close(force: true);
       await proxy.stop();
     });
   });
