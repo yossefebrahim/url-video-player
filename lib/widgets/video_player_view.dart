@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import '../app_theme.dart';
 import '../models/video_item.dart';
 import '../services/clear_key.dart';
+import '../services/live_hls_proxy.dart';
 import '../services/wakelock_coordinator.dart';
 
 /// Inline native video player (better_player_plus / ExoPlayer) for a [VideoItem].
@@ -77,10 +78,20 @@ class _VideoPlayerViewState extends State<VideoPlayerView> {
       // probe the bytes and force the right container. Fall back to HLS when the
       // probe is inconclusive — opaque hand-offs in this ecosystem are HLS.
       if (ClearKeyResolver.needsSniff(resolved)) {
-        final sniffed =
-            await ClearKeyResolver.sniffFormat(resolved.url, headers: headers);
+        final probed = await ClearKeyResolver.probe(resolved.url, headers: headers);
         if (_isStale(gen)) return;
-        resolved = resolved.withFormat(sniffed ?? 'hls');
+        final format = probed.format ?? 'hls';
+        if (format == 'hls' && probed.hasInlineDataKey) {
+          // These beIN/nazika channels lock segments with an inline `data:` key
+          // ExoPlayer can't fetch. Route through the local proxy, which unwraps
+          // the key and serves it back over http so ExoPlayer plays natively.
+          final proxied =
+              await LiveHlsProxy.instance.wrap(resolved.url, userAgent: ua);
+          if (_isStale(gen)) return;
+          resolved = ResolvedStream(proxied, format: 'hls');
+        } else {
+          resolved = resolved.withFormat(format);
+        }
       }
 
       final dataSource = BetterPlayerDataSource(

@@ -124,14 +124,64 @@ class ClearKeyResolver {
     }
   }
 
-  /// Reads up to ~2 KB from the response, enough to see a manifest's first line.
-  static Future<String> _readHead(HttpClientResponse response) async {
+  /// Reads up to [limit] bytes from the response, enough to see a manifest's
+  /// first line (and, for [probe], its `#EXT-X-KEY`).
+  static Future<String> _readHead(HttpClientResponse response,
+      [int limit = 2048]) async {
     final bytes = <int>[];
     await for (final chunk in response) {
       bytes.addAll(chunk);
-      if (bytes.length >= 2048) break;
+      if (bytes.length >= limit) break;
     }
-    return utf8.decode(bytes.take(2048).toList(), allowMalformed: true);
+    return utf8.decode(bytes.take(limit).toList(), allowMalformed: true);
+  }
+
+  /// Like [sniffFormat] but also reports whether an HLS media playlist carries
+  /// an **inline `data:` URI content key** — the obfuscated beIN/nazika live
+  /// channels. ExoPlayer can't fetch a `data:` key, so those must be routed
+  /// through `LiveHlsProxy`. [hasInlineDataKey] is also set for HLS *master*
+  /// playlists (their nested media playlists may carry such a key), so the
+  /// caller can proxy them too.
+  static Future<({String? format, bool hasInlineDataKey})> probe(String url,
+      {Map<String, String>? headers}) async {
+    HttpClient? client;
+    try {
+      client = HttpClient()..connectionTimeout = const Duration(seconds: 8);
+      final request = await client.getUrl(Uri.parse(url));
+      headers?.forEach(request.headers.set);
+      final response = await request.close().timeout(const Duration(seconds: 10));
+
+      final mime = response.headers.contentType?.mimeType.toLowerCase() ?? '';
+      final head = (await _readHead(response, 65536)).trimLeft();
+
+      String? format;
+      if (mime.contains('mpegurl') || head.startsWith('#EXTM3U')) {
+        format = 'hls';
+      } else if (mime.contains('dash+xml') ||
+          head.startsWith('<?xml') ||
+          head.contains('<MPD')) {
+        format = 'dash';
+      }
+
+      var hasKey = false;
+      if (format == 'hls') {
+        if (head.contains('#EXT-X-STREAM-INF')) {
+          hasKey = true; // master — proxy so nested media playlists are handled
+        } else {
+          for (final line in const LineSplitter().convert(head)) {
+            if (line.startsWith('#EXT-X-KEY') && line.contains('URI="data:')) {
+              hasKey = true;
+              break;
+            }
+          }
+        }
+      }
+      return (format: format, hasInlineDataKey: hasKey);
+    } catch (_) {
+      return (format: null, hasInlineDataKey: false);
+    } finally {
+      client?.close(force: true);
+    }
   }
 
   /// Lower-cased file extension of the URL path (query/fragment stripped), or
