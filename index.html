@@ -34,13 +34,23 @@
     // origin of a proxied contentId); lines logged before that are queued.
     let beaconUrl = null;
     const pending = [];
+    function flushBeacon() {
+      if (!beaconUrl || pending.length === 0) return;
+      const batch = pending.splice(0);
+      try {
+        fetch(beaconUrl, { method: 'POST', body: batch.join('\n') })
+          .catch(() => requeue(batch));
+      } catch (e) { requeue(batch); }
+    }
+    function requeue(batch) {
+      // Put failed lines back so the next log() retries them; bound growth so a
+      // persistently-unreachable phone can't grow this without limit.
+      pending.unshift.apply(pending, batch);
+      while (pending.length > 100) pending.shift();
+    }
     function beacon(line) {
       pending.push(line);
-      if (!beaconUrl) return;
-      const body = pending.splice(0).join('\n');
-      try {
-        fetch(beaconUrl, { method: 'POST', body: body }).catch(() => {});
-      } catch (e) {}
+      flushBeacon();
     }
     function log(msg) {
       const t = new Date().toISOString().substr(11, 8);
@@ -86,8 +96,18 @@
           if (custom.beacon) {
             beaconUrl = custom.beacon;
           } else if (/^http:\/\//.test(url)) {
-            beaconUrl = new URL('/beacon', url).toString();
+            // Only fall back to the contentId origin when it's a LAN/private
+            // host (the phone proxy). For a public CDN this would POST our
+            // diagnostics to an unrelated origin — don't.
+            try {
+              const h = new URL(url).hostname;
+              if (/^(10\.|127\.|192\.168\.|169\.254\.|localhost$)/.test(h) ||
+                  /^172\.(1[6-9]|2\d|3[01])\./.test(h)) {
+                beaconUrl = new URL('/beacon', url).toString();
+              }
+            } catch (e) {}
           }
+          flushBeacon();
           log('LOAD ' + (m.contentType || '?') + '  ' + (url || '?'));
         } catch (e) { log('LOAD (unparseable): ' + e); }
         return request;
