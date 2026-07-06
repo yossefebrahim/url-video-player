@@ -5,12 +5,13 @@
 //
 // Usage: dart run tool/hls_proxy_validate.dart '<playlistUrl>' '<userAgent>'
 import 'dart:async';
+import 'dart:io';
 
 import 'package:vp/services/cast_proxy_server.dart';
 
 Future<void> main(List<String> args) async {
   if (args.isEmpty) {
-    print('usage: dart run tool/hls_proxy_validate.dart <playlistUrl> [userAgent]');
+    stdout.writeln('usage: dart run tool/hls_proxy_validate.dart <playlistUrl> [userAgent]');
     return;
   }
   final proxy = HlsCastProxy(
@@ -20,7 +21,7 @@ Future<void> main(List<String> args) async {
     },
   );
   final url = await proxy.start();
-  print('PROXY_URL=$url');
+  stdout.writeln('PROXY_URL=$url');
   // Keep alive long enough to ffprobe / ffmpeg-record a few live segments.
   await Future<void>.delayed(const Duration(seconds: 90));
   await proxy.stop();

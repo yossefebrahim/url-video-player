@@ -61,7 +61,12 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   void _onPassiveCastDisconnect() {
-    if (mounted) _snack('Cast disconnected.');
+    if (!mounted) return;
+    // The TV dropped the session on its own. Don't silently remount the local
+    // player and autoplay the cast item from 0:00 behind a snackbar — return to
+    // the idle poster; the item is still in history for the user to replay.
+    setState(() => _current = null);
+    _snack('Cast disconnected.');
   }
 
   /// A deep link / shared URL: persist to history, and play it if it was an

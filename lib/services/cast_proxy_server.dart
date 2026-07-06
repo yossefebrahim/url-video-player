@@ -88,8 +88,26 @@ abstract class CastProxy {
     }
   }
 
+  /// Cap on a single `/beacon` POST body — it only ever carries a few short log
+  /// lines, so anything larger is a runaway receiver or a hostile LAN peer.
+  static const int _maxBeaconBytes = 64 * 1024;
+
   Future<void> _handleBeacon(HttpRequest req) async {
-    final body = await utf8.decodeStream(req.cast<List<int>>());
+    if ((req.contentLength) > _maxBeaconBytes) {
+      req.response.statusCode = HttpStatus.requestEntityTooLarge;
+      await req.response.close();
+      return;
+    }
+    final bytes = <int>[];
+    await for (final chunk in req) {
+      bytes.addAll(chunk);
+      if (bytes.length > _maxBeaconBytes) {
+        req.response.statusCode = HttpStatus.requestEntityTooLarge;
+        await req.response.close();
+        return;
+      }
+    }
+    final body = utf8.decode(bytes, allowMalformed: true);
     for (final line in const LineSplitter().convert(body)) {
       if (line.trim().isEmpty) continue;
       receiverLog.add(line);
@@ -104,23 +122,37 @@ abstract class CastProxy {
 
   // ── networking ─────────────────────────────────────────────────────────────
 
+  /// Per-request idle/response deadline for upstream fetches. `connectionTimeout`
+  /// only bounds the TCP handshake; a CDN edge that connects then stalls
+  /// mid-body would otherwise hang the receiver's segment fetch forever.
+  static const Duration _fetchTimeout = Duration(seconds: 20);
+
   Future<Uint8List> fetchBytes(String url) async =>
       (await _fetch(url)).$1;
 
   /// Fetches [url] and returns (body, effectiveUrl) — live playlists commonly
   /// redirect to a CDN edge, and relative segment URIs must resolve against
   /// the URL that actually served the playlist, not the one we asked for.
+  ///
+  /// Throws on a non-2xx status (a rolling live window hands back 403/404 for
+  /// expired tokens/aged-out segments; without this the HTML/JSON error body
+  /// would be served to the receiver as "media" behind a 200) and on a stalled
+  /// body ([_fetchTimeout]).
   Future<(Uint8List, Uri)> _fetch(String url) async {
     final uri = Uri.parse(url);
     final req = await _client.getUrl(uri);
     upstreamHeaders.forEach(req.headers.set);
-    final resp = await req.close();
+    final resp = await req.close().timeout(_fetchTimeout);
+    if (resp.statusCode < 200 || resp.statusCode >= 300) {
+      resp.drain<void>().ignore();
+      throw HttpException('upstream ${resp.statusCode} for $url');
+    }
     var effective = uri;
     for (final r in resp.redirects) {
       effective = effective.resolveUri(r.location);
     }
     final chunks = <int>[];
-    await for (final c in resp) {
+    await for (final c in resp.timeout(_fetchTimeout)) {
       chunks.addAll(c);
     }
     return (Uint8List.fromList(chunks), effective);
@@ -199,25 +231,39 @@ class CastProxyServer extends CastProxy {
     if (path == '/manifest.mpd') {
       await _serveManifest(res);
     } else if (path.startsWith('/init/')) {
-      final idx = int.parse(path.substring('/init/'.length));
+      final idx = int.tryParse(path.substring('/init/'.length));
+      if (idx == null) return _notFound(res);
       await _serveInit(res, idx);
     } else if (path.startsWith('/seg/')) {
       final parts = path.substring('/seg/'.length).split('/');
-      await _serveSegment(res, int.parse(parts[0]), parts[1]);
+      final idx = parts.length == 2 ? int.tryParse(parts[0]) : null;
+      if (idx == null) return _notFound(res);
+      await _serveSegment(res, idx, parts[1]);
     } else {
-      res.statusCode = 404;
-      await res.close();
+      await _notFound(res);
     }
+  }
+
+  Future<void> _notFound(HttpResponse res) async {
+    res.statusCode = 404;
+    await res.close();
   }
 
   /// Fetches + rewrites the manifest once, populating [_reps]. Memoised on the
   /// in-flight future so concurrent early segment requests can't double-fetch
   /// (a second `_reps.clear()` mid-parse would yank entries from under the
-  /// request that's already indexing into them).
+  /// request that's already indexing into them). A *failed* fetch clears the
+  /// memo so a transient DNS/Wi-Fi/timeout error doesn't permanently brick the
+  /// session with a cached rejected future.
   Future<void> _ensureParsed() => _parsing ??= () async {
-        final (bytes, effective) = await _fetch(upstreamMpdUrl);
-        _rewrittenManifest =
-            _rewriteManifest(String.fromCharCodes(bytes), effective);
+        try {
+          final (bytes, effective) = await _fetch(upstreamMpdUrl);
+          _rewrittenManifest =
+              _rewriteManifest(String.fromCharCodes(bytes), effective);
+        } catch (e) {
+          _parsing = null;
+          rethrow;
+        }
       }();
 
   Future<void> _serveManifest(HttpResponse res) async {
@@ -229,6 +275,7 @@ class CastProxyServer extends CastProxy {
 
   Future<void> _serveInit(HttpResponse res, int idx) async {
     await _ensureParsed();
+    if (idx < 0 || idx >= _reps.length) return _notFound(res);
     final bytes = await fetchBytes(_reps[idx].initUrl);
     final clear = decryptor.rewriteInit(bytes);
     res.headers.contentType = ContentType('video', 'mp4');
@@ -238,6 +285,7 @@ class CastProxyServer extends CastProxy {
 
   Future<void> _serveSegment(HttpResponse res, int idx, String number) async {
     await _ensureParsed();
+    if (idx < 0 || idx >= _reps.length) return _notFound(res);
     final url = _reps[idx].mediaTemplate.replaceAll(r'$Number$', number);
     final bytes = await fetchBytes(url);
     final clear = decryptor.decryptSegment(bytes);
@@ -301,10 +349,23 @@ class _Rep {
 class HlsCastProxy extends CastProxy {
   final String upstreamPlaylistUrl;
 
-  HlsCastProxy({required this.upstreamPlaylistUrl, super.upstreamHeaders});
+  HlsCastProxy({required this.upstreamPlaylistUrl, super.upstreamHeaders}) {
+    final host = Uri.parse(upstreamPlaylistUrl).host.toLowerCase();
+    if (host.isNotEmpty) _allowedHosts.add(host);
+  }
 
   /// AES keys by key-URL — fetched once, reused across segments/rotations.
   final Map<String, Uint8List> _keys = {};
+
+  /// SSRF guard: the only hosts this proxy will fetch are ones it itself
+  /// referenced while rewriting a real upstream playlist (segment / key / MAP /
+  /// variant hosts — which legitimately span several CDNs), plus the origin
+  /// playlist host. A `?u=`/`?k=` decoding to any other host (169.254.169.254,
+  /// the router, an internal service) is rejected — the server binds anyIPv4
+  /// with open CORS, so without this any LAN peer could drive it as a relay.
+  final Set<String> _allowedHosts = {};
+
+  static final RegExp _refToken = RegExp(r'[?&][uk]=([A-Za-z0-9_-]+)');
 
   @override
   String get entryPath => '/playlist.m3u8';
@@ -325,14 +386,39 @@ class HlsCastProxy extends CastProxy {
     }
   }
 
+  /// True if [encoded] (a base64url `u`/`k` token) decodes to a URL whose host
+  /// we've referenced this session.
+  bool _isAllowed(String encoded) {
+    try {
+      return _allowedHosts.contains(
+          Uri.parse(HlsRewriter.decodeUrl(encoded)).host.toLowerCase());
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Records the hosts of every `u`/`k` reference we just emitted so subsequent
+  /// segment/key/variant requests for them pass [_isAllowed].
+  void _recordAllowed(String rewrittenPlaylist) {
+    for (final m in _refToken.allMatches(rewrittenPlaylist)) {
+      try {
+        final host =
+            Uri.parse(HlsRewriter.decodeUrl(m.group(1)!)).host.toLowerCase();
+        if (host.isNotEmpty) _allowedHosts.add(host);
+      } catch (_) {}
+    }
+  }
+
   /// Live playlists are never cached: every receiver poll re-fetches upstream
   /// so the rolling window (MEDIA-SEQUENCE) stays current.
   Future<void> _servePlaylist(HttpResponse res, String? u) async {
+    if (u != null && !_isAllowed(u)) return _forbidden(res);
     final upstream =
         u == null ? upstreamPlaylistUrl : HlsRewriter.decodeUrl(u);
     final (bytes, effective) = await _fetch(upstream);
     final rewritten =
         HlsRewriter.rewrite(String.fromCharCodes(bytes), effective);
+    _recordAllowed(rewritten);
     res.headers.contentType = ContentType('application', 'vnd.apple.mpegurl');
     res.headers.set(HttpHeaders.cacheControlHeader, 'no-cache');
     res.add(Uint8List.fromList(rewritten.codeUnits));
@@ -342,16 +428,16 @@ class HlsCastProxy extends CastProxy {
   Future<void> _serveSegment(
       HttpResponse res, Map<String, String> params) async {
     final u = params['u'];
-    if (u == null) {
-      res.statusCode = 404;
-      await res.close();
-      return;
-    }
-    var bytes = await fetchBytes(HlsRewriter.decodeUrl(u));
-
     final keyParam = params['k'];
     final iv = HlsRewriter.decodeIv(params['iv']);
-    if (keyParam != null && iv != null) {
+    final decrypting = keyParam != null && iv != null;
+    // Validate EVERY client-supplied host before any upstream fetch, so a bad
+    // key can't be masked by the segment fetch happening first.
+    if (u == null || !_isAllowed(u)) return _forbidden(res);
+    if (decrypting && !_isAllowed(keyParam)) return _forbidden(res);
+
+    var bytes = await fetchBytes(HlsRewriter.decodeUrl(u));
+    if (decrypting) {
       final keyUrl = HlsRewriter.decodeUrl(keyParam);
       final key = _keys[keyUrl] ??= await _fetchKey(keyUrl);
       bytes = decryptAes128Cbc(key, iv, bytes);
@@ -372,14 +458,15 @@ class HlsCastProxy extends CastProxy {
 
   /// Pass-through key fetch for methods we can't decrypt (SAMPLE-AES).
   Future<void> _serveKey(HttpResponse res, String? u) async {
-    if (u == null) {
-      res.statusCode = 404;
-      await res.close();
-      return;
-    }
+    if (u == null || !_isAllowed(u)) return _forbidden(res);
     final bytes = await fetchBytes(HlsRewriter.decodeUrl(u));
     res.headers.contentType = ContentType('application', 'octet-stream');
     res.add(bytes);
+    await res.close();
+  }
+
+  Future<void> _forbidden(HttpResponse res) async {
+    res.statusCode = HttpStatus.forbidden;
     await res.close();
   }
 

@@ -137,6 +137,45 @@ void main() {
     });
   });
 
+  group('garbage-prefixed URLs (Ostora 407<F> regression)', () {
+    test('extra: strips a "407<F>" prefix before the real https URL', () {
+      final link = LinkParser.parsePayload({
+        'type': 'extra',
+        'url': '407<F>https://mbcvod-enc.edgenextcdn.net/out/v1/x/index.mpd'
+            '?aws.manifestfilter=video_codec:H264',
+      });
+      expect(link!.item.url,
+          'https://mbcvod-enc.edgenextcdn.net/out/v1/x/index.mpd'
+          '?aws.manifestfilter=video_codec:H264');
+    });
+
+    test('obfuscated urlplayer://play decode + sanitize yields a clean URL', () {
+      const garbage = '407<F>https://www2.nazika.shop/x1/56_4.json?token=abc';
+      final enc = encodeObfuscated(garbage);
+      final link = LinkParser.parseUri('urlplayer://play?url=$enc');
+      expect(link!.item.url,
+          'https://www2.nazika.shop/x1/56_4.json?token=abc');
+      expect(link.item.mode, PlayerMode.native);
+    });
+
+    test('preserves the ###k:kid ClearKey suffix when stripping a prefix', () {
+      final link = LinkParser.parsePayload({
+        'type': 'extra',
+        'url': 'GARBAGE-https://host.tld/index.mpd###key:kid',
+      });
+      expect(link!.item.url, 'https://host.tld/index.mpd###key:kid');
+    });
+
+    test('leaves a clean URL untouched (no-op), incl. later http in a query',
+        () {
+      final link = LinkParser.parsePayload({
+        'type': 'extra',
+        'url': 'https://host.tld/p?next=http://other.tld/a.mp4',
+      });
+      expect(link!.item.url, 'https://host.tld/p?next=http://other.tld/a.mp4');
+    });
+  });
+
   group('titleFromUrl', () {
     test('derives a readable title from the file name', () {
       expect(LinkParser.titleFromUrl('http://h.tld/a/My_Great-Movie.mp4'),

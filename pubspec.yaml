@@ -49,6 +49,16 @@ dependencies:
   wakelock_plus: ^1.2.8
   pointycastle: ^4.0.0
 
+# Vendored fork of flutter_chrome_cast 1.4.6 with a fix to route selection:
+# upstream's selectRoute() picks the FIRST MediaRouter route matching a device
+# id, which on some devices (Samsung Smart View / a lingering remote-display
+# session) is a phantom ROUTE_TYPE_USER route that never starts a CAF session,
+# so connect times out. The fork prefers the genuine Cast route.
+# See third_party/flutter_chrome_cast/PATCH_NOTES.md.
+dependency_overrides:
+  flutter_chrome_cast:
+    path: third_party/flutter_chrome_cast
+
 dev_dependencies:
   flutter_test:
     sdk: flutter

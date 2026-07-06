@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
@@ -113,6 +114,48 @@ void main() {
       final u = RegExp(r'u=([^&\s]+)').firstMatch(out)!.group(1)!;
       expect(HlsRewriter.decodeUrl(u),
           'https://edge.example.net/s/1.jpg?tok=a+b&x=1');
+    });
+
+    test('encrypted EXT-X-MAP carries a key + IV so it is not served encrypted',
+        () {
+      const explicit = '#EXTM3U\n'
+          '#EXT-X-MEDIA-SEQUENCE:3\n'
+          '#EXT-X-KEY:METHOD=AES-128,URI="k.bin",IV=0x000000000000000000000000000000FF\n'
+          '#EXT-X-MAP:URI="init.mp4"\n'
+          '#EXTINF:6.0,\n'
+          'a.ts\n';
+      final e = HlsRewriter.rewrite(explicit, base);
+      final mapLine = e.split('\n').firstWhere((l) => l.contains('EXT-X-MAP'));
+      expect(mapLine, contains('seg.ts?'));
+      expect(mapLine, contains('&k='));
+      expect(mapLine, contains('&iv=000000000000000000000000000000ff'));
+
+      // No explicit IV → falls back to the media-sequence IV (never a bare ref).
+      const implicit = '#EXTM3U\n'
+          '#EXT-X-MEDIA-SEQUENCE:3\n'
+          '#EXT-X-KEY:METHOD=AES-128,URI="k.bin"\n'
+          '#EXT-X-MAP:URI="init.mp4"\n';
+      final i = HlsRewriter.rewrite(implicit, base);
+      final mapLine2 = i.split('\n').firstWhere((l) => l.contains('EXT-X-MAP'));
+      expect(mapLine2, contains('&k='));
+      expect(mapLine2, contains('&iv=00000000000000000000000000000003'));
+    });
+
+    test('malformed AES-128 key with no URI resets key state (no stale key)',
+        () {
+      const playlist = '#EXTM3U\n'
+          '#EXT-X-KEY:METHOD=AES-128,URI="k.bin"\n'
+          '#EXTINF:6.0,\n'
+          'enc.ts\n'
+          '#EXT-X-KEY:METHOD=AES-128\n' // malformed: no URI
+          '#EXTINF:6.0,\n'
+          'after.ts\n';
+      final out = HlsRewriter.rewrite(playlist, base);
+      final segs =
+          out.split('\n').where((l) => l.startsWith('seg.ts?')).toList();
+      expect(segs[0], contains('&k='));
+      // The segment after the malformed key must NOT reuse the previous key.
+      expect(segs[1], isNot(contains('&k=')));
     });
   });
 
@@ -265,6 +308,90 @@ void main() {
           mediaHits + 1);
 
       client.close(force: true);
+      await proxy.stop();
+    });
+  });
+
+  group('HlsCastProxy hardening', () {
+    late HttpServer upstream;
+    late Uri upstreamBase;
+
+    setUpAll(() async {
+      upstream = await HttpServer.bind(InternetAddress.anyIPv4, 0);
+      upstreamBase = Uri.parse('http://127.0.0.1:${upstream.port}/');
+      upstream.listen((req) async {
+        // Every path 404s — used to prove the proxy rejects an upstream error
+        // instead of relaying its error body as media.
+        req.response.statusCode = 404;
+        await req.response.close();
+      });
+    });
+
+    tearDownAll(() async {
+      await upstream.close(force: true);
+    });
+
+    String enc(String url) =>
+        base64Url.encode(utf8.encode(url)).replaceAll('=', '');
+
+    Future<int> status(Uri url, {String method = 'GET', List<int>? body}) async {
+      final client = HttpClient();
+      try {
+        final req = await client.openUrl(method, url);
+        if (body != null) req.add(body);
+        final resp = await req.close();
+        await resp.drain<void>();
+        return resp.statusCode;
+      } finally {
+        client.close(force: true);
+      }
+    }
+
+    test('SSRF: a segment whose host was never referenced is 403', () async {
+      final proxy = HlsCastProxy(
+        upstreamPlaylistUrl: upstreamBase.resolve('/live/x.json').toString(),
+      );
+      final entry = (await proxy.start())!;
+      // 169.254.169.254 (cloud metadata) was never in any served playlist.
+      final evil = enc('http://169.254.169.254/latest/meta-data/');
+      expect(await status(entry.resolve('/seg.ts?u=$evil')),
+          HttpStatus.forbidden);
+      // A key pointing off-allowlist is likewise refused.
+      final okHost = enc(upstreamBase.resolve('/live/seg1.ts').toString());
+      final evilKey = enc('http://10.0.0.1/key');
+      expect(
+          await status(entry.resolve('/seg.ts?u=$okHost&k=$evilKey'
+              '&iv=00000000000000000000000000000000')),
+          HttpStatus.forbidden);
+      await proxy.stop();
+    });
+
+    test('upstream non-2xx is surfaced as 502, not relayed as media', () async {
+      final proxy = HlsCastProxy(
+        upstreamPlaylistUrl: upstreamBase.resolve('/live/x.json').toString(),
+      );
+      final entry = (await proxy.start())!;
+      // Seeded upstream host is allow-listed, so this passes the SSRF gate and
+      // reaches _fetch, which sees the upstream 404 and must throw → 502.
+      final segUrl = enc(upstreamBase.resolve('/live/gone.ts').toString());
+      expect(await status(entry.resolve('/seg.ts?u=$segUrl')),
+          HttpStatus.badGateway);
+      await proxy.stop();
+    });
+
+    test('/beacon rejects an oversized body', () async {
+      final proxy = HlsCastProxy(
+        upstreamPlaylistUrl: upstreamBase.resolve('/live/x.json').toString(),
+      );
+      final entry = (await proxy.start())!;
+      final huge = List<int>.filled(80 * 1024, 0x41); // 80 KiB > 64 KiB cap
+      expect(await status(entry.resolve('/beacon'), method: 'POST', body: huge),
+          HttpStatus.requestEntityTooLarge);
+      // A small beacon still works.
+      expect(
+          await status(entry.resolve('/beacon'),
+              method: 'POST', body: utf8.encode('hello')),
+          204);
       await proxy.stop();
     });
   });

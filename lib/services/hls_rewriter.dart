@@ -53,12 +53,22 @@ class HlsRewriter {
           keyUri = null;
           keyIv = null;
           out.writeln(line);
-        } else if (method == 'AES-128' && attrs['URI'] != null) {
-          keyUri = playlistUri.resolve(attrs['URI']!).toString();
-          keyIv = _parseIvAttr(attrs['IV']);
+        } else if (method == 'AES-128') {
+          // A non-NONE method without a URI is malformed (RFC 8216 requires it):
+          // reset key state rather than leaving the previous key active, which
+          // would decrypt following segments with the wrong key into garbage.
+          if (attrs['URI'] == null) {
+            keyUri = null;
+            keyIv = null;
+          } else {
+            keyUri = playlistUri.resolve(attrs['URI']!).toString();
+            keyIv = _parseIvAttr(attrs['IV']);
+          }
           // Dropped: the proxy decrypts, so the output stream is clear.
         } else {
           // SAMPLE-AES etc — can't decrypt here; at least proxy the key fetch.
+          keyUri = null;
+          keyIv = null;
           final uri = attrs['URI'];
           out.writeln(uri == null
               ? line
@@ -71,10 +81,13 @@ class HlsRewriter {
         if (uri == null) {
           out.writeln(line);
         } else {
-          // A MAP under an AES-128 key must carry an explicit IV to be
-          // decryptable (the media-sequence rule doesn't apply to it).
-          final target = _segmentRef(playlistUri.resolve(uri),
-              keyUri: keyUri, iv: keyIv);
+          // A MAP under an AES-128 key should carry an explicit IV (the
+          // media-sequence rule doesn't apply to it); fall back to the current
+          // sequence IV so the proxy still DECRYPTS it rather than emitting a
+          // bare ref that serves the init segment still-encrypted.
+          final iv = keyUri == null ? null : (keyIv ?? _sequenceIv(mediaSequence));
+          final target =
+              _segmentRef(playlistUri.resolve(uri), keyUri: keyUri, iv: iv);
           out.writeln(line.replaceFirst('URI="$uri"', 'URI="$target"'));
         }
       } else if (line.startsWith('#EXT-X-PROGRAM-DATE-TIME:')) {

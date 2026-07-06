@@ -3,13 +3,13 @@ import 'dart:io' show Platform;
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter_chrome_cast/flutter_chrome_cast.dart';
-import 'package:wakelock_plus/wakelock_plus.dart';
 
 import '../models/video_item.dart';
 import 'cast_media_mapper.dart';
 import 'cast_proxy_server.dart';
 import 'cenc_decryptor.dart';
 import 'clear_key.dart';
+import 'wakelock_coordinator.dart';
 
 /// Lifecycle of a Cast session as the UI cares about it.
 enum CastPhase { idle, discovering, connecting, connected, castingMedia, error }
@@ -127,6 +127,10 @@ class CastService {
   }) async {
     if (!supported) return false;
     await ensureInitialized();
+    // Tear down any proxy left over from a prior/aborted session up front, so a
+    // connect that fails before _prepareMedia can't leave an orphaned HTTP
+    // server bound and the wakelock pinned for the rest of the app's life.
+    await _stopProxy();
     _set(CastState(CastPhase.connecting, deviceName: device.friendlyName));
     try {
       final started =
@@ -164,6 +168,11 @@ class CastService {
       return true;
     } catch (e) {
       debugPrint('CastService.connectAndCast failed: $e');
+      // If we already adopted a proxy before the throw (loadMedia /
+      // _awaitPlaybackStarted can throw), tear it down here too — otherwise the
+      // HTTP server and wakelock leak, since the error phase never becomes
+      // "active" so _onSessionChanged won't clean up either.
+      await _endSessionQuietly();
       _set(CastState(CastPhase.error,
           deviceName: device.friendlyName,
           errorMessage: "Couldn't cast this video on your TV"));
@@ -251,11 +260,7 @@ class CastService {
       throw StateError('No Wi-Fi address available for the cast proxy');
     }
     _proxy = proxy;
-    try {
-      await WakelockPlus.enable();
-    } catch (e) {
-      debugPrint('CastService: wakelock enable failed: $e');
-    }
+    await WakelockCoordinator.instance.acquire(this);
     return localUrl;
   }
 
@@ -264,11 +269,7 @@ class CastService {
     _proxy = null;
     if (proxy == null) return;
     await proxy.stop();
-    try {
-      await WakelockPlus.disable();
-    } catch (e) {
-      debugPrint('CastService: wakelock disable failed: $e');
-    }
+    await WakelockCoordinator.instance.release(this);
   }
 
   static String _beaconUrl(Uri localUrl) =>

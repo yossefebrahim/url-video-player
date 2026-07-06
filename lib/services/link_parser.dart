@@ -27,7 +27,8 @@ class LinkParser {
       for (final marker in const ['urlvplayer://', 'urlplayer://']) {
         if (url!.startsWith(marker)) url = url.substring(marker.length);
       }
-      if (url!.isEmpty) return null;
+      url = _sanitizeUrl(url!);
+      if (url.isEmpty) return null;
       var agent = payload['agent'] as String?;
       if (agent != null && (agent.isEmpty || agent == 'Web Player')) {
         agent = null;
@@ -133,6 +134,8 @@ class LinkParser {
       mode = PlayerMode.web;
     }
     if (resolved == null || resolved.isEmpty) return null;
+    resolved = _sanitizeUrl(resolved);
+    if (resolved.isEmpty) return null;
 
     return ParsedLink(
       item: VideoItem(
@@ -144,6 +147,28 @@ class LinkParser {
       ),
       autoPlay: true,
     );
+  }
+
+  // Schemes this app can actually play (parseUri gates on the same set). Used
+  // only to decide whether a decoded URL is already well-formed; matching one
+  // of these at the START means "leave it alone".
+  static final _knownScheme =
+      RegExp(r'^(https?|file|content)://', caseSensitive: false);
+  static final _httpScheme = RegExp(r'https?://', caseSensitive: false);
+
+  /// Defensive guard on a decoded/handed-off URL: some senders (e.g. a newer
+  /// Ostora build) prepend a few stray bytes before the real link — the app was
+  /// seen storing `407<F>https://…/index.mpd`, which ExoPlayer rejects with
+  /// `MalformedURLException: no protocol`. If the string doesn't already start
+  /// with a playable scheme but an `http(s)://` appears further in, drop the
+  /// leading junk. A no-op for well-formed URLs (including the `…###k:kid`
+  /// ClearKey form and `file://`/`content://` links, whose scheme is at the
+  /// start), and it never rewrites a later scheme inside a query string.
+  static String _sanitizeUrl(String url) {
+    final trimmed = url.trim();
+    if (trimmed.isEmpty || _knownScheme.hasMatch(trimmed)) return trimmed;
+    final m = _httpScheme.firstMatch(trimmed);
+    return (m != null && m.start > 0) ? trimmed.substring(m.start) : trimmed;
   }
 
   /// URL-safe Base64 -> bytes -> XOR(key) -> URLDecode. Returns null on failure.

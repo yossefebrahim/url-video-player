@@ -1,10 +1,10 @@
 import 'package:better_player_plus/better_player_plus.dart';
 import 'package:flutter/material.dart';
-import 'package:wakelock_plus/wakelock_plus.dart';
 
 import '../app_theme.dart';
 import '../models/video_item.dart';
 import '../services/clear_key.dart';
+import '../services/wakelock_coordinator.dart';
 
 /// Inline native video player (better_player_plus / ExoPlayer) for a [VideoItem].
 ///
@@ -144,20 +144,29 @@ class _VideoPlayerViewState extends State<VideoPlayerView> {
 
       controller.addEventsListener((event) {
         if (_isStale(gen)) return;
-        if (event.betterPlayerEventType == BetterPlayerEventType.initialized) {
-          final vpc = controller.videoPlayerController;
-          final value = vpc?.value;
-          if (value != null) {
-            widget.onInitialized?.call(
-              value.duration ?? Duration.zero,
-              value.size ?? Size.zero,
-            );
-          }
-          WakelockPlus.enable();
-        } else if (event.betterPlayerEventType ==
-            BetterPlayerEventType.progress) {
-          final position = controller.videoPlayerController?.value.position;
-          if (position != null) widget.positionSink?.value = position;
+        switch (event.betterPlayerEventType) {
+          case BetterPlayerEventType.initialized:
+            final vpc = controller.videoPlayerController;
+            final value = vpc?.value;
+            if (value != null) {
+              widget.onInitialized?.call(
+                value.duration ?? Duration.zero,
+                value.size ?? Size.zero,
+              );
+            }
+            WakelockCoordinator.instance.acquire(this);
+          case BetterPlayerEventType.progress:
+            final position = controller.videoPlayerController?.value.position;
+            if (position != null) widget.positionSink?.value = position;
+          case BetterPlayerEventType.exception:
+          case BetterPlayerEventType.finished:
+            // Playback stopped after initializing (stream died mid-play, or
+            // ended). better_player renders its own error/end UI inside this
+            // subtree without tearing down our State, so release the wakelock
+            // here or it stays held on a stopped video, draining the battery.
+            WakelockCoordinator.instance.release(this);
+          default:
+            break;
         }
       });
 
@@ -183,7 +192,7 @@ class _VideoPlayerViewState extends State<VideoPlayerView> {
     _generation++;
     _controller?.dispose();
     _controller = null;
-    WakelockPlus.disable();
+    WakelockCoordinator.instance.release(this);
   }
 
   @override
