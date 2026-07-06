@@ -10,6 +10,13 @@ live HEVC channels — built and validated the whole phone-side pipeline, then
 diagnosed why on-device casting could not connect at all, fixed that, and ran a
 full video-player + cast lifecycle audit with fixes.
 
+> **Companion doc:** the focused, executable procedure for finishing the cast
+> route fix lives in [`docs/cast-route-fix-plan.md`](../cast-route-fix-plan.md)
+> — build/deploy steps, the on-device verification gates, and the decision tree.
+> This hand-off is the surrounding context; that plan is the step-by-step. If you
+> are an autonomous agent resuming the cast work, read §0 here, then follow the
+> plan, and see §7 below for how to run without getting locked.
+
 ---
 
 ## 1. Live-HLS cast pipeline — BUILT and host-VALIDATED ✅
@@ -82,6 +89,17 @@ on-device** — see §3.
 
 ---
 
+> **RESOLVED (2026-07-06, follow-up session):** on-device verification ran. The
+> route fix works (Gate A ✓; the phantom route was gone — note the framework's
+> `Selecting route: UserRouteInfo` line is normal androidx→platform sync, not
+> the failure signature). The remaining connect timeout had a different cause:
+> the TV does not report the unpublished custom receiver `7B6F0F4A` as
+> available (its route lacks `CATEGORY_CAST/7B6F0F4A`), so CAF ignores the
+> selection. Workaround: `CastService.ensureInitialized` now inits with
+> `CC1AD845` — and the full cast then **worked end-to-end** (session connected,
+> MBC ClearKey DASH PLAYING at 1080p via the phone CENC proxy). The Cast-console
+> registration check below is now the only blocker for the custom HEVC receiver.
+
 ## 3. What still needs a device (the one open item) ⏳
 
 The on-device confirmation could not be completed because (a) the user picked up
@@ -149,11 +167,26 @@ new proxy/rewriter/hardening coverage).
 SSRF/statusCode/timeout/beacon/index hardening), `lib/services/cast_service.dart`
 (live-HLS branch, proxy lifecycle, wakelock coordinator), `lib/widgets/video_player_view.dart`
 (wakelock coordinator + error/finish release), `lib/screens/home_screen.dart`
-(passive-disconnect idle), `cast_receiver/index.html` (beacon + Shaka + LAN-only
-beacon; pushed to `gh-pages`), `pubspec.yaml` (`dependency_overrides`).
+(passive-disconnect idle), `lib/services/link_parser.dart` (`_sanitizeUrl` — strips
+the `407<F>` deep-link prefix; see below), `test/link_parser_test.dart`,
+`cast_receiver/index.html` (beacon + Shaka + LAN-only beacon; pushed to `gh-pages`),
+`pubspec.yaml` (`dependency_overrides`).
 
-> Nothing committed to `main` — all app changes are in the working tree. Only the
-> `gh-pages` branch (receiver) was pushed.
+**Late fix — deep-link `407<F>` regression (verified on-device):** the source app
+(Ostora) began sending deep links whose decoded URL had a literal `407<F>` prefix
+before `https://`, so ExoPlayer rejected series/episodes/lives with
+`MalformedURLException: no protocol`. This was NOT the cast fork
+(`link_parser.dart`/`deep_link_service.dart`/`android/` were unchanged; the input
+changed). `LinkParser._sanitizeUrl` now drops junk before the real `http(s)://`.
+Confirmed: the MBC ClearKey series stores a clean URL and plays. Caveats: only
+*new* deep links are sanitized (old `407<F>` history rows stay broken until
+re-opened); and some live channels have a *separate* `unknown protocol: data`
+issue (inline `data:` HLS key `better_player` can't open locally).
+
+> These changes were **committed to `main`** during the session (commits
+> `eaf8ae1`, `b520147` — done by the user's tooling, not by an agent; verify with
+> `git log`). The `gh-pages` branch (receiver) was also pushed. Confirm state with
+> `git status` / `git log --oneline` before assuming an uncommitted working tree.
 
 ---
 
@@ -171,3 +204,41 @@ beacon; pushed to `gh-pages`), `pubspec.yaml` (`dependency_overrides`).
 - Two documented, deferred cast limitations: UA-gated **unencrypted** DASH casts
   to origin and falls back locally after a ~15 s honest error; **byte-range** HLS
   is unsupported (targeted channels use full-file TS segments).
+
+---
+
+## 7. Working autonomously without getting locked (Fable 5)
+
+This hand-off is meant to be resumed by an autonomous agent. To finish the open
+cast work (§3) end-to-end without stalling or needing the user mid-flow, follow
+these operating rules — the executable procedure with its objective pass/fail
+gates is in [`docs/cast-route-fix-plan.md`](../cast-route-fix-plan.md) (§7 there):
+
+- **Don't block on long operations.** Run `flutter clean`/`build`/`install` in the
+  background and continue on the completion notification; never foreground-sleep
+  for the whole build (the harness blocks long foreground `sleep` anyway). Use a
+  single short sleep only for "wait N seconds then read logcat", never an
+  open-ended wait.
+- **The device may be in use.** Before any `input tap`, take a `screencap` and
+  confirm the app is foreground. If the user is actively on the phone, switch to
+  **read-only** diagnostics (`logcat -d`, `screencap`, DB pull) and report — do
+  not tap over them. (This actually happened this session: taps landed on the
+  user's other app.)
+- **Decisions are objective, not user-gated.** Every checkpoint (route chosen →
+  session connected → receiver playing → honest fallback) is read from
+  `logcat`/screenshot. You should not need to ask the user except for a genuine
+  scope choice or the browser-only Cast-console step (§3). The only hard external
+  dependency is the physical rig (TV + phone + shared Wi-Fi) — if it's absent,
+  **stop and report**, don't hang.
+- **`flutter clean` is mandatory** after any `third_party/flutter_chrome_cast`
+  edit, or the patched Kotlin won't recompile (Gradle caches the path-override
+  plugin build). Verify the patch actually ran by grepping logcat for
+  `DiscoveryManager: selectRoute(<id>): N match(es)`.
+- **Reconnect adb resiliently** (port randomises — mDNS recipe in the header) and
+  **pull a fresh, `curl`-checked stream URL** right before casting (URLs expire;
+  a stale `403` masquerades as a cast failure).
+- **Keep actions reversible.** Prefer `adb install -r` (preserves the history DB);
+  reserve `flutter clean`+`flutter install` for when the native fork changed.
+  Don't commit or push unless explicitly asked.
+- **One change at a time.** If a gate fails, fix only that (usually the build) and
+  re-test on a clean base — don't stack speculative edits on an unverified build.
