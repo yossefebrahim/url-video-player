@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:better_player_plus/better_player_plus.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -37,13 +38,20 @@ class TvPlayerScreen extends StatefulWidget {
   State<TvPlayerScreen> createState() => _TvPlayerScreenState();
 }
 
-class _TvPlayerScreenState extends State<TvPlayerScreen> {
+class _TvPlayerScreenState extends State<TvPlayerScreen>
+    with WidgetsBindingObserver {
   BetterPlayerController? _controller;
   final FocusNode _rootFocus = FocusNode(debugLabel: 'tv-player-root');
   // A real FocusScope for the controls menu: its own scope lets the first
   // button's autofocus win (the route scope is already held by _rootFocus) and
   // keeps directional traversal contained inside the menu.
   final FocusScopeNode _menuScope = FocusScopeNode(debugLabel: 'tv-menu');
+
+  /// Live playback position, refreshed on every progress event. Drives ONLY the
+  /// small time label (via a ValueListenableBuilder in the overlays), so a
+  /// progress tick no longer setState-rebuilds the whole screen stack (player +
+  /// overlays) 2-4x/s on a weak TV GPU.
+  final ValueNotifier<Duration> _position = ValueNotifier(Duration.zero);
 
   /// Lightweight bottom HUD (play state + position); does NOT take focus, so
   /// the D-pad keeps seeking while it's up. Auto-hides.
@@ -67,6 +75,12 @@ class _TvPlayerScreenState extends State<TvPlayerScreen> {
   int _autoRetries = 0;
   Timer? _retryTimer;
 
+  /// True while the app is backgrounded: the player is fully unmounted (its
+  /// ExoPlayer decoder + buffer released), then remounted fresh at the live edge
+  /// on resume. A cached TV process must not sit holding tens of MB of paused
+  /// buffer — that's how the low-memory killer picks it instead of resuming it.
+  bool _suspended = false;
+
   static const Duration _seekStep = Duration(seconds: 10);
   static const Duration _infoTimeout = Duration(seconds: 3);
   static const int _maxAutoRetries = 5;
@@ -75,6 +89,7 @@ class _TvPlayerScreenState extends State<TvPlayerScreen> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     // True fullscreen: hide status/nav bars (mostly a phone concern; harmless
     // on a TV, which is already full-bleed).
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
@@ -82,14 +97,60 @@ class _TvPlayerScreenState extends State<TvPlayerScreen> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _infoTimer?.cancel();
     _seekTimer?.cancel();
     _retryTimer?.cancel();
     _controller?.removeEventsListener(_onPlayerEvent);
+    _position.dispose();
     _rootFocus.dispose();
     _menuScope.dispose();
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
     super.dispose();
+  }
+
+  /// Backgrounding on a TV tears the player down entirely (not just pause):
+  /// `handleLifecycle` would keep the ExoPlayer decoder + buffer resident in the
+  /// cached process, and resuming a *paused live* stream plays a stale edge and
+  /// often stalls anyway. So on `paused`/`hidden` we unmount the player, and on
+  /// `resumed` remount it fresh at the live edge.
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    switch (state) {
+      case AppLifecycleState.paused:
+      case AppLifecycleState.hidden:
+        if (_suspended || !mounted) return;
+        // Cancel anything that could remount/mutate the player while we're away.
+        _retryTimer?.cancel();
+        _seekTimer?.cancel();
+        // Drop the coalesced pending seek too: its timer just got cancelled
+        // without flushing, so leaving it set would offset the first seek after
+        // we resume onto a freshly-remounted (live-edge) stream.
+        _pendingSeek = Duration.zero;
+        _infoTimer?.cancel();
+        _controller?.removeEventsListener(_onPlayerEvent);
+        setState(() {
+          _suspended = true;
+          // The old controller is unmounted (and force-disposed) with the
+          // VideoPlayerView; drop our handle so stray input can't touch it.
+          _controller = null;
+          _menuOpen = false;
+          _infoVisible = false;
+          _hasError = false;
+        });
+      case AppLifecycleState.resumed:
+        if (!_suspended || !mounted) return;
+        setState(() {
+          _suspended = false;
+          _hasError = false;
+          _autoRetries = 0;
+          _controller = null;
+          _attempt++; // remount fresh at the live edge
+        });
+      case AppLifecycleState.inactive:
+      case AppLifecycleState.detached:
+        break; // transient focus loss — don't tear the player down
+    }
   }
 
   void _onControllerReady(BetterPlayerController controller) {
@@ -157,8 +218,14 @@ class _TvPlayerScreenState extends State<TvPlayerScreen> {
     if (!mounted) return;
     switch (event.betterPlayerEventType) {
       case BetterPlayerEventType.progress:
+        // Push the position into its notifier only — the overlays' time labels
+        // rebuild via ValueListenableBuilder; the screen stack does not.
+        final pos = _controller?.videoPlayerController?.value.position;
+        if (pos != null) _position.value = pos;
+        break;
       case BetterPlayerEventType.changedTrack:
-        if (_infoVisible || _menuOpen) setState(() {});
+        // Quality switched — refresh the menu's selected chip while it's open.
+        if (_menuOpen) setState(() {});
         break;
       default:
         break;
@@ -312,18 +379,22 @@ class _TvPlayerScreenState extends State<TvPlayerScreen> {
           child: Stack(
             fit: StackFit.expand,
             children: [
-              Positioned.fill(
-                child: VideoPlayerView(
-                  // The attempt counter makes a reconnect remount the player.
-                  key: ValueKey('${widget.item.url}#$_attempt'),
-                  item: widget.item,
-                  tvMode: true,
-                  screenAspectRatio: screenAspect,
-                  onControllerReady: _onControllerReady,
-                  onInitialized: widget.onInitialized,
-                  onErrorChanged: _onErrorChanged,
+              // Unmounted while backgrounded (_suspended) so the ExoPlayer
+              // decoder + buffer are released; remounted fresh on resume via the
+              // bumped attempt key.
+              if (!_suspended)
+                Positioned.fill(
+                  child: VideoPlayerView(
+                    // The attempt counter makes a reconnect remount the player.
+                    key: ValueKey('${widget.item.url}#$_attempt'),
+                    item: widget.item,
+                    tvMode: true,
+                    screenAspectRatio: screenAspect,
+                    onControllerReady: _onControllerReady,
+                    onInitialized: widget.onInitialized,
+                    onErrorChanged: _onErrorChanged,
+                  ),
                 ),
-              ),
               if (_hasError)
                 _ErrorOverlay(
                   item: widget.item,
@@ -336,6 +407,7 @@ class _TvPlayerScreenState extends State<TvPlayerScreen> {
                   child: _ControlsMenu(
                     controller: _controller,
                     item: widget.item,
+                    position: _position,
                     coverFit: _coverFit,
                     onTogglePlayPause: _togglePlayPause,
                     onSeek: _seekBy,
@@ -344,7 +416,10 @@ class _TvPlayerScreenState extends State<TvPlayerScreen> {
                   ),
                 )
               else if (_infoVisible)
-                _InfoBar(controller: _controller, item: widget.item),
+                _InfoBar(
+                    controller: _controller,
+                    item: widget.item,
+                    position: _position),
             ],
           ),
         ),
@@ -358,7 +433,12 @@ class _TvPlayerScreenState extends State<TvPlayerScreen> {
 class _InfoBar extends StatelessWidget {
   final BetterPlayerController? controller;
   final VideoItem item;
-  const _InfoBar({required this.controller, required this.item});
+  final ValueListenable<Duration> position;
+  const _InfoBar({
+    required this.controller,
+    required this.item,
+    required this.position,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -378,8 +458,13 @@ class _InfoBar extends StatelessWidget {
             ),
           ),
           const SizedBox(width: 12),
-          Text(_positionLabel(controller),
-              style: const TextStyle(color: Colors.white70, fontSize: 14)),
+          ValueListenableBuilder<Duration>(
+            valueListenable: position,
+            builder: (context, pos, _) => Text(
+              _positionLabelFor(controller, pos),
+              style: const TextStyle(color: Colors.white70, fontSize: 14),
+            ),
+          ),
           const SizedBox(width: 16),
           const Text('▲  Options',
               style: TextStyle(color: Colors.white54, fontSize: 13)),
@@ -446,6 +531,7 @@ class _ErrorOverlay extends StatelessWidget {
 class _ControlsMenu extends StatelessWidget {
   final BetterPlayerController? controller;
   final VideoItem item;
+  final ValueListenable<Duration> position;
   final bool coverFit;
   final VoidCallback onTogglePlayPause;
   final void Function(Duration) onSeek;
@@ -455,6 +541,7 @@ class _ControlsMenu extends StatelessWidget {
   const _ControlsMenu({
     required this.controller,
     required this.item,
+    required this.position,
     required this.coverFit,
     required this.onTogglePlayPause,
     required this.onSeek,
@@ -489,9 +576,14 @@ class _ControlsMenu extends StatelessWidget {
                         fontWeight: FontWeight.w600),
                   ),
                 ),
-                Text(_positionLabel(c),
+                ValueListenableBuilder<Duration>(
+                  valueListenable: position,
+                  builder: (context, pos, _) => Text(
+                    _positionLabelFor(c, pos),
                     style:
-                        const TextStyle(color: Colors.white70, fontSize: 14)),
+                        const TextStyle(color: Colors.white70, fontSize: 14),
+                  ),
+                ),
               ],
             ),
             const SizedBox(height: 14),
@@ -610,10 +702,11 @@ String qualityLabel(BetterPlayerAsmsTrack t) {
   return h > 0 ? '${h}p' : 'Auto';
 }
 
-String _positionLabel(BetterPlayerController? c) {
-  final value = c?.videoPlayerController?.value;
-  final pos = value?.position ?? Duration.zero;
-  final dur = value?.duration;
+/// Builds the "pos" (live) or "pos / dur" (VOD) label. [pos] is the live value
+/// from the screen's position notifier; the duration is read from the controller
+/// (stable once known, null for live).
+String _positionLabelFor(BetterPlayerController? c, Duration pos) {
+  final dur = c?.videoPlayerController?.value.duration;
   if (dur == null || dur.inMilliseconds <= 0) {
     return formatMediaTime(pos); // live / unknown
   }

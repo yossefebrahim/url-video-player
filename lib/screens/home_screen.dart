@@ -50,7 +50,9 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   void initState() {
     super.initState();
-    _reload();
+    // NB: no eager _reload() here — it would run two full-table queries before
+    // the device type is known, i.e. on the TV zap path where the lists never
+    // render. The phone loads them in _initDeepLinks once _isTv resolves false.
     _initDeepLinks();
     CastService.instance.passiveDisconnects
         .addListener(_onPassiveCastDisconnect);
@@ -62,6 +64,9 @@ class _HomeScreenState extends State<HomeScreen> {
     // and so the touch home UI never flashes on a TV.
     final isTv = await PlatformInfo.isTv();
     if (mounted) setState(() => _isTv = isTv);
+    // Phone only: populate history/favorites. On TV this is skipped entirely
+    // (the lists have no UI), keeping SQLite off the intent→video path.
+    if (!isTv) _reload();
     try {
       final initial = await DeepLinkService.instance.getInitialLink();
       if (initial != null && mounted) _handleLink(initial);
@@ -89,6 +94,9 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _reload() async {
+    // The history/favorites lists only exist in the phone home UI; on a TV this
+    // is a pure hand-off → player, so skip the queries entirely.
+    if (_isTv == true) return;
     final h = await _db.getHistory();
     final f = await _db.getFavorites();
     if (mounted) {
@@ -100,6 +108,20 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _openItem(VideoItem item, {required bool autoPlay}) async {
+    if (_isTv == true) {
+      // TV zap path: start playback immediately — the intent→video latency must
+      // not wait on a SQLite upsert + reload, and the lists never render on TV.
+      // Still record the open in the background so history stays complete (e.g.
+      // for a future TV browse mode, or when the same URL is later cast/opened
+      // on a phone sharing this DB).
+      if (autoPlay) _play(item);
+      unawaited(_db.upsert(item).then(
+        (_) {},
+        onError: (Object e, StackTrace s) =>
+            debugPrint('HomeScreen._openItem (tv) background upsert failed: $e'),
+      ));
+      return;
+    }
     try {
       final saved = await _db.upsert(item);
       await _reload();
@@ -134,7 +156,9 @@ class _HomeScreenState extends State<HomeScreen> {
           ),
         ),
       );
-      _enrichThumbnail(item);
+      // No _enrichThumbnail on TV: it opens a SECOND connection to the same
+      // stream (MediaMetadataRetriever) and decodes a full-res frame while
+      // ExoPlayer is starting, for a poster the TV UI never shows.
       return;
     }
     setState(() => _current = item);

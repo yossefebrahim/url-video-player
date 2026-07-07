@@ -9,6 +9,7 @@ import 'cast_media_mapper.dart';
 import 'cast_proxy_server.dart';
 import 'cenc_decryptor.dart';
 import 'clear_key.dart';
+import 'platform_info.dart';
 import 'wakelock_coordinator.dart';
 
 /// Lifecycle of a Cast session as the UI cares about it.
@@ -68,8 +69,13 @@ class CastService {
   /// Wi-Fi, so [_adoptProxy] holds a wakelock for its lifetime.
   CastProxy? _proxy;
 
-  /// Cast is only wired for Android in this build.
-  bool get supported => Platform.isAndroid;
+  /// Cast is only wired for Android phones in this build. A TV is a Cast
+  /// *receiver*, never a sender, so the whole CAF/MediaRouter stack is gated
+  /// off there — it must never be initialized or held resident on a low-memory
+  /// TV. (`isTvOrNull` is already resolved by the time any cast path runs; a
+  /// null verdict — pre-resolution — conservatively allows the phone path.)
+  bool get supported =>
+      Platform.isAndroid && PlatformInfo.isTvOrNull != true;
 
   /// Live list of discovered devices (empty until [startDiscovery]).
   Stream<List<GoogleCastDevice>> get devices =>

@@ -150,11 +150,16 @@ class MainActivity : FlutterActivity() {
                     MediaMetadataRetriever.OPTION_CLOSEST_SYNC,
                 )
                 if (frame != null) {
+                    // Scale down before encoding: a full 1080p/4K frame is
+                    // wasteful on disk and forces a large decode in the Flutter
+                    // image cache for a ~104 px-wide list tile. Cap width at 480.
+                    val scaled = scaleToWidth(frame, 480)
                     val out = File(outPath)
                     out.parentFile?.mkdirs()
                     FileOutputStream(out).use { fos ->
-                        frame.compress(Bitmap.CompressFormat.JPEG, 80, fos)
+                        scaled.compress(Bitmap.CompressFormat.JPEG, 80, fos)
                     }
+                    if (scaled !== frame) scaled.recycle()
                     frame.recycle()
                     if (out.exists() && out.length() > 0) path = outPath
                 }
@@ -168,5 +173,18 @@ class MainActivity : FlutterActivity() {
             }
             mainHandler.post { result.success(path) }
         }.start()
+    }
+
+    /**
+     * Returns [src] scaled down so its width is at most [maxWidth], preserving
+     * aspect ratio. Returns [src] unchanged when it is already narrow enough
+     * (the caller checks identity before recycling).
+     */
+    private fun scaleToWidth(src: Bitmap, maxWidth: Int): Bitmap {
+        val w = src.width
+        val h = src.height
+        if (w <= maxWidth || w <= 0) return src
+        val targetH = (h.toLong() * maxWidth / w).toInt().coerceAtLeast(1)
+        return Bitmap.createScaledBitmap(src, maxWidth, targetH, true)
     }
 }

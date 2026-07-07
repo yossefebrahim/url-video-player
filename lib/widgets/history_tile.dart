@@ -110,6 +110,10 @@ class _Thumbnail extends StatelessWidget {
               Image.file(
                 File(path),
                 fit: BoxFit.cover,
+                // Decode into (roughly) the 104-wide tile at 2x density instead
+                // of at the stored frame's full resolution — a 1080p poster is
+                // ~8 MB decoded, 4K ~33 MB, held in the image cache per row.
+                cacheWidth: 208,
                 errorBuilder: (_, _, _) => _placeholder(),
               )
             else

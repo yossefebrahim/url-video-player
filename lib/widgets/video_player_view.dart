@@ -137,6 +137,18 @@ class _VideoPlayerViewState extends State<VideoPlayerView> {
                 clearKey: resolved.clearKeyJson,
               )
             : null,
+        // Cap ExoPlayer's buffer. better_player_plus defaults maxBufferMs to
+        // ~109 minutes (6,553,600 ms), which lets the buffer grow toward the
+        // allocator's byte cap (~130 MB) — an OOM/LMK magnet on a 1 GB Google
+        // TV, worst on VOD. 60 s of media is a few MB at live bitrates and is
+        // plenty to ride out network hiccups. Lower bufferForPlaybackMs also
+        // shaves start latency (faster channel-zap).
+        bufferingConfiguration: const BetterPlayerBufferingConfiguration(
+          minBufferMs: 15000,
+          maxBufferMs: 60000,
+          bufferForPlaybackMs: 2000,
+          bufferForPlaybackAfterRebufferMs: 5000,
+        ),
       );
 
       final tv = widget.tvMode;
@@ -160,6 +172,10 @@ class _VideoPlayerViewState extends State<VideoPlayerView> {
             onEdit: widget.onEdit,
           ),
           controlsConfiguration: BetterPlayerControlsConfiguration(
+            // TV: the host owns a custom D-pad HUD, so the plugin's entire
+            // Material controls layer (and its visibility timers + periodic
+            // progress rebuilds) is dead weight — don't build it at all.
+            showControls: !tv,
             enablePlayPause: true,
             enableSkips: true, // ±10s, relative (skipForward/skipBack)
             forwardSkipTimeInMilliseconds: 10000,

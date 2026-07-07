@@ -15,6 +15,13 @@ class PlatformInfo {
   static const MethodChannel _channel = MethodChannel('info.t4w.vp/deeplink');
   static bool? _isTv;
 
+  /// The cached verdict, or null if [isTv] hasn't resolved yet. Lets
+  /// synchronous call sites (e.g. `CastService.supported`) gate on device type
+  /// without re-hitting the channel or awaiting. Any cast entry point only runs
+  /// from the phone home UI, which itself only renders after [isTv] has
+  /// resolved to false — so this is never null at those call sites.
+  static bool? get isTvOrNull => _isTv;
+
   /// True on Android TV / Google TV; false on phones and on any platform or
   /// error where the native probe is unavailable (so the app degrades to the
   /// existing inline player rather than breaking).

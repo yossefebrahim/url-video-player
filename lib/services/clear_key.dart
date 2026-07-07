@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
-import 'dart:typed_data';
+
+import 'package:flutter/foundation.dart';
 
 /// A stream URL split into its playable manifest and optional decryption config.
 class ResolvedStream {
@@ -136,14 +137,35 @@ class ClearKeyResolver {
     return utf8.decode(bytes.take(limit).toList(), allowMalformed: true);
   }
 
+  /// Session cache of successful [probe] verdicts, keyed by url + User-Agent.
+  /// A stream's container and inline-key status don't change between the first
+  /// play and the auto-reconnects seconds later, so this lets each remount skip
+  /// a fresh 64 KB origin fetch (and its up-to-10 s timeout). Only *successful*
+  /// probes (a non-null format) are cached — a null verdict is treated as a
+  /// transient network failure that a retry should re-probe.
+  static final Map<String, ({String? format, bool hasInlineDataKey})>
+      _probeCache = {};
+
+  /// Clears the [probe] memo. Test-only — probe verdicts are session-scoped
+  /// (these URLs carry per-session tokens), so production never needs to.
+  @visibleForTesting
+  static void clearProbeCache() => _probeCache.clear();
+
   /// Like [sniffFormat] but also reports whether an HLS media playlist carries
   /// an **inline `data:` URI content key** — the obfuscated beIN/nazika live
   /// channels. ExoPlayer can't fetch a `data:` key, so those must be routed
   /// through `LiveHlsProxy`. [hasInlineDataKey] is also set for HLS *master*
   /// playlists (their nested media playlists may carry such a key), so the
   /// caller can proxy them too.
+  ///
+  /// Successful verdicts are memoized for the session (see [_probeCache]) so a
+  /// reconnect doesn't re-fetch the manifest head.
   static Future<({String? format, bool hasInlineDataKey})> probe(String url,
       {Map<String, String>? headers}) async {
+    final cacheKey = '$url\n${headers?['User-Agent'] ?? ''}';
+    final cached = _probeCache[cacheKey];
+    if (cached != null) return cached;
+
     HttpClient? client;
     try {
       client = HttpClient()..connectionTimeout = const Duration(seconds: 8);
@@ -176,7 +198,10 @@ class ClearKeyResolver {
           }
         }
       }
-      return (format: format, hasInlineDataKey: hasKey);
+      final result = (format: format, hasInlineDataKey: hasKey);
+      // Only memoize a real verdict; a null format is a transient failure.
+      if (format != null) _probeCache[cacheKey] = result;
+      return result;
     } catch (_) {
       return (format: null, hasInlineDataKey: false);
     } finally {

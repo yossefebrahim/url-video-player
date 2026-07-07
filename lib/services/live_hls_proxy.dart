@@ -114,6 +114,12 @@ class LiveHlsProxy {
     }
   }
 
+  /// Hard cap on a fetched playlist body. Real HLS media/master playlists are a
+  /// few KB; anything past this is a broken origin or a mis-served media file,
+  /// which we refuse rather than accumulate into one giant String on the main
+  /// isolate (this runs on every live playlist refresh for the whole session).
+  static const int _maxPlaylistBytes = 4 * 1024 * 1024;
+
   Future<String?> _fetch(String url, String? ua) async {
     final client = _client;
     if (client == null) return null;
@@ -127,7 +133,14 @@ class LiveHlsProxy {
         await response.drain<void>().catchError((_) {});
         return null;
       }
-      return await response.transform(utf8.decoder).join();
+      final bytes = <int>[];
+      await for (final chunk in response) {
+        bytes.addAll(chunk);
+        // Oversized: returning breaks the `await for`, which cancels the
+        // subscription and tears down the connection — no drain needed.
+        if (bytes.length > _maxPlaylistBytes) return null;
+      }
+      return utf8.decode(bytes, allowMalformed: true);
     } catch (_) {
       return null;
     }
